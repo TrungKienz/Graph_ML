@@ -1,0 +1,16 @@
+# Core numeric and data processing stack
+numpy>=1.26
+pandas>=2.2
+
+# PyTorch and graph learning
+torch>=2.3
+torch-geometric>=2.5
+
+# Evaluation, experiments, and plotting
+scikit-learn>=1.4
+matplotlib>=3.8
+tqdm>=4.66
+
+# Notebook support
+ipykernel>=6.29
+jupyterlab>=4.2
