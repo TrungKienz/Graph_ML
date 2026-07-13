@@ -1,0 +1,29 @@
+{
+  "dataset_root": "./data/MovieLens1M",
+  "artifacts_root": "./artifacts",
+  "positive_threshold": 4.0,
+  "min_interactions": 5,
+  "embedding_dim": 64,
+  "num_layers": 3,
+  "batch_size": 2048,
+  "epochs": 50,
+  "lr": 0.001,
+  "weight_decay": 0.0,
+  "reg_weight": 0.0001,
+  "patience": 10,
+  "monitor": "recall@20",
+  "top_k": [
+    10,
+    20
+  ],
+  "eval_batch_users": 256,
+  "seeds": [
+    42,
+    52,
+    62
+  ],
+  "device": "cuda",
+  "save_curves": true,
+  "seed": 62,
+  "model_name": "bprmf"
+}
