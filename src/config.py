@@ -72,7 +72,7 @@ NUM_LAYERS: int = 3              # LightGCN propagation layers (embeddings aggre
 # ---------------------------------------------------------------------------
 LR: float = 1e-3
 BATCH_SIZE: int = 2048
-NUM_EPOCHS: int = 50
+NUM_EPOCHS: int = 100
 WEIGHT_DECAY: float = 1e-4       # L2 regularization coefficient (lambda in BPR loss)
 NUM_NEGATIVES: int = 1           # negative samples per positive for BPR
 
