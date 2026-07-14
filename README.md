@@ -22,7 +22,8 @@ Current implementation status:
 
 - `MostPopular` is implemented in `src/baselines.py`.
 - Shared full-ranking evaluation metrics are implemented in `src/metrics.py`.
-- BPR-MF, LightGCN, and ILE are planned next steps and should not be treated as completed yet.
+- `BPR-MF` and `LightGCN` are implemented in `src/models.py`, with the BPR loss in `src/losses.py` and training/negative-sampling loops in `src/train.py`. Both are wired into `notebooks/main.ipynb` and evaluated through `evaluate_full_ranking`.
+- ILE (Item Loss Equalization) is the remaining next step and builds on the LightGCN training loop.
 
 ## Repository Structure
 
