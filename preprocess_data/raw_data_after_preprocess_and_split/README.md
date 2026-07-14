@@ -16,8 +16,8 @@ Mỗi file đều có cùng cấu trúc:
 
 | Column      | Data Type | Description                                            |
 | ----------- | --------- | ------------------------------------------------------ |
-| `user_idx`  | `int64`   | Chỉ số (index) của user, được ánh xạ từ user ID gốc.   |
-| `movie_idx` | `int64`   | Chỉ số (index) của movie, được ánh xạ từ movie ID gốc. |
+| `user_idx`  | `int64`   | Re-indexed user ID.   |
+| `movie_idx` | `int64`   | Re-indexed movie ID. |
 | `rating`    | `float64` | Giá trị rating mà user dành cho movie.                 |
 | `timestamp` | `int64`   | Thời điểm user đánh giá movie (Unix timestamp).        |
 
