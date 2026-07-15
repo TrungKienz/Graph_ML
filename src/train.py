@@ -19,9 +19,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
+import sys
+from pathlib import Path
 
-from . import config
-from .config import (
+# Add current directory to path for imports
+sys.path.append(str(Path(__file__).parent))
+
+import config
+from config import (
     BATCH_SIZE,
     EMBEDDING_DIM,
     LR,
@@ -31,8 +36,8 @@ from .config import (
     SEED,
     WEIGHT_DECAY,
 )
-from .losses import bpr_loss, l2_regularization
-from .models import BPRMF, LightGCNRecommender
+from losses import bpr_loss, l2_regularization
+from models import BPRMF, LightGCNRecommender
 
 
 def sample_bpr_batch(
@@ -77,8 +82,10 @@ def sample_bpr_batch(
         seen = train_user_pos_items[users_list[b]]
         j = neg_list[b]
         while j in seen:
-            j = int(torch.randint(0, num_items, (1,), generator=generator).item())
+            # CRITICAL FIX: Ensure we get int, not tensor to avoid dtype issues
+            j = torch.randint(0, num_items, (1,), generator=generator).item()
         neg_list[b] = j
+    # CRITICAL FIX: Explicitly create tensor with correct dtype
     neg_items = torch.tensor(neg_list, dtype=torch.long)
 
     return users, pos_items, neg_items

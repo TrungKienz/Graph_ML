@@ -1,0 +1,17 @@
+#!/bin/bash
+#SBATCH --job-name=thuongnm_hust      # define job name
+#SBATCH --nodes=1             # define node
+#SBATCH --gpus-per-node=1     # define gpu limmit in 1 node
+#SBATCH --ntasks=1            # define number tasks
+#SBATCH --cpus-per-task=24    # There are 24 CPU cores
+#SBATCH --time=3-00:20:00     # Max running time = 10 minutes
+
+nvidia-smi
+echo "-----------------------------"
+
+python train_final_seeds.py
+
+echo "-----------------------------"
+echo "Exit worker node"
+
+

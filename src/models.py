@@ -20,7 +20,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .config import EMBEDDING_DIM, NUM_LAYERS
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parent))
+from config import EMBEDDING_DIM, NUM_LAYERS
 
 
 class BPRMF(nn.Module):
@@ -133,10 +136,20 @@ class LightGCNRecommender(nn.Module):
         device = self.embedding.weight.device
         edge_index = edge_index.to(device)
         row, col = edge_index[0], edge_index[1]
+        
+        # CRITICAL FIX: Add bounds checking for edge indices
+        if row.numel() > 0:  # Only check if edges exist
+            if row.min() < 0 or row.max() >= self.num_nodes:
+                raise ValueError(f"Row indices out of bounds: [{row.min()}, {row.max()}], expected [0, {self.num_nodes-1}]")
+            if col.min() < 0 or col.max() >= self.num_nodes:
+                raise ValueError(f"Column indices out of bounds: [{col.min()}, {col.max()}], expected [0, {self.num_nodes-1}]")
 
-        deg = torch.bincount(row, minlength=self.num_nodes).to(torch.float32)
-        deg_inv_sqrt = deg.pow(-0.5)
-        deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+        # CRITICAL FIX: Ensure degree tensor is float and handle edge case
+        deg = torch.bincount(row, minlength=self.num_nodes).float()
+        
+        # Handle isolated nodes: degree 0 -> deg^(-0.5) = inf -> set to 0
+        deg_inv_sqrt = torch.where(deg > 0, deg.pow(-0.5), torch.zeros_like(deg))
+        
         norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
 
         adj = torch.sparse_coo_tensor(
@@ -186,6 +199,16 @@ class LightGCNRecommender(nn.Module):
             three ego tensors are the *initial* (layer-0) embeddings of the batch
             nodes, used for L2 regularization (LightGCN regularizes E^(0) only).
         """
+        # CRITICAL FIX: Add bounds checking for user and item indices
+        if users.min() < 0 or users.max() >= self.num_users:
+            raise ValueError(f"User indices out of bounds: [{users.min()}, {users.max()}], expected [0, {self.num_users-1}]")
+        
+        if pos_items.min() < 0 or pos_items.max() >= self.num_items:
+            raise ValueError(f"Positive item indices out of bounds: [{pos_items.min()}, {pos_items.max()}], expected [0, {self.num_items-1}]")
+            
+        if neg_items.min() < 0 or neg_items.max() >= self.num_items:
+            raise ValueError(f"Negative item indices out of bounds: [{neg_items.min()}, {neg_items.max()}], expected [0, {self.num_items-1}]")
+        
         user_emb, item_emb = self.propagate(edge_index)
 
         u = user_emb[users]
@@ -195,8 +218,19 @@ class LightGCNRecommender(nn.Module):
         neg_scores = (u * n).sum(dim=-1)
 
         u0 = self.embedding(users)
-        p0 = self.embedding(pos_items + self.num_users)
-        n0 = self.embedding(neg_items + self.num_users)
+        
+        # CRITICAL FIX: Add bounds checking for offset item embeddings
+        pos_item_nodes = pos_items + self.num_users
+        neg_item_nodes = neg_items + self.num_users
+        
+        if pos_item_nodes.max() >= self.num_nodes:
+            raise ValueError(f"Positive item node indices out of bounds: max={pos_item_nodes.max()}, num_nodes={self.num_nodes}")
+            
+        if neg_item_nodes.max() >= self.num_nodes:
+            raise ValueError(f"Negative item node indices out of bounds: max={neg_item_nodes.max()}, num_nodes={self.num_nodes}")
+        
+        p0 = self.embedding(pos_item_nodes)
+        n0 = self.embedding(neg_item_nodes)
         return pos_scores, neg_scores, (u0, p0, n0)
 
     @torch.no_grad()
