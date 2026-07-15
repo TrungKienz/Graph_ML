@@ -1,119 +1,345 @@
 # Popularity-Aware LightGCN for Long-Tail Movie Recommendation
 
-Graph Analytics for Big Data course project on top-K movie recommendation with popularity-bias analysis.
+Graph Analytics for Big Data course project on top-K movie recommendation with
+popularity-bias analysis, evaluated on **MovieLens-1M**.
 
-## Project Overview
+Ratings `>= 4` are treated as positive implicit feedback and represented as a
+user–movie bipartite graph. Beyond standard accuracy metrics (Recall@K,
+NDCG@K), the project measures whether models over-recommend popular movies
+and how much exposure long-tail items actually receive, and proposes a method
+— **Popularity-Aware LightGCN** — designed to reduce that bias without
+destroying accuracy.
 
-This project studies recommendation on the MovieLens 1M dataset. Ratings greater than or equal to 4 are treated as positive implicit feedback, and the data is represented as a user-movie bipartite graph.
+## Table of Contents
 
-The main goal is to compare standard recommendation accuracy with long-tail behavior. In addition to top-K metrics such as Recall@K and NDCG@K, the project evaluates whether models over-recommend popular movies and how much exposure tail items receive.
+- [Problem and Goal](#problem-and-goal)
+- [Method](#method)
+- [Metrics](#metrics)
+- [Repository Structure](#repository-structure)
+- [Data](#data)
+- [Environment Setup](#environment-setup)
+- [Remote GPU Workflow (A100 cluster)](#remote-gpu-workflow-a100-cluster)
+- [How to Run](#how-to-run)
+- [Results](#results)
+- [Reproducibility Notes](#reproducibility-notes)
+- [Documentation](#documentation)
+- [Team Workflow](#team-workflow)
 
-## Method Summary
+## Problem and Goal
 
-Planned model variants:
+Standard collaborative-filtering models (BPR-MF, LightGCN) trained with a
+plain BPR loss tend to concentrate almost all recommendation slots on a small
+set of already-popular movies ("head" items), starving the long tail of any
+exposure. On this dataset, a vanilla `LightGCN` baseline recommends **head**
+items in ~96% of its top-20 slots (`HeadExposure@20 ≈ 0.959`) while covering
+only ~40% of the catalog.
 
-- `MostPopular`: non-personalized baseline that recommends movies by training-set popularity.
-- `BPR-MF`: matrix factorization trained with Bayesian Personalized Ranking loss.
-- `LightGCN`: graph collaborative filtering model using user-item message passing.
-- `LightGCN + Item Loss Equalization (ILE)`: LightGCN variant that reweights item contributions to reduce popularity bias.
-- Optional degree-aware graph augmentation: graph modification strategy based on item degree/popularity.
+The goal of this project is to design and validate a method that pushes
+recommendations toward the long tail (higher `TailRecall@20`, higher
+`Coverage@20`, lower `ARP@20`, lower `HeadExposure@20`) while keeping
+top-K accuracy (`Recall@20`, `NDCG@20`) close to the baseline — i.e. a
+genuine accuracy/fairness trade-off, not accuracy collapse.
 
-Current implementation status:
+## Method
 
-- `MostPopular` is implemented in `src/baselines.py`.
-- Shared full-ranking evaluation metrics are implemented in `src/metrics.py`.
-- `BPR-MF` and `LightGCN` are implemented in `src/models.py`, with the BPR loss in `src/losses.py` and training/negative-sampling loops in `src/train.py`. Both are wired into `notebooks/main.ipynb` and evaluated through `evaluate_full_ranking`.
-- ILE (Item Loss Equalization) is the remaining next step and builds on the LightGCN training loop.
+**Popularity-Aware LightGCN** extends a standard LightGCN backbone with four
+independently-toggleable components (see `src/popaware_training.py`):
+
+1. **Item Loss Equalization (ILE)** — items are split into `tail` / `middle` /
+   `head` groups by training-graph degree (bottom 50% / next 30% / top 20%,
+   see `src/config.py`). An auxiliary penalty
+   `λ_ILE * (mean_BPR_loss(head) - mean_BPR_loss(tail))^2` is added to the
+   objective so the model is discouraged from fitting head items much better
+   than tail items. Implemented in `src/ile_losses.py`.
+2. **Degree-Aware Graph Augmentation** — for contrastive view generation,
+   edges incident to popular items are dropped with higher probability
+   (log-scaled with item degree, bounded in `[DROPOUT_P_MIN, DROPOUT_P_MAX]`).
+   Dropout is applied **symmetrically**: the keep/drop decision is made once
+   per undirected user–item interaction and mirrored to both the
+   user→item and item→user directions, so the propagated graph stays a valid
+   undirected graph. Implemented in `src/ile_losses.py`
+   (`compute_degree_aware_dropout_probs`) and
+   `src/popaware_training.py` (`symmetric_edge_dropout`).
+3. **Contrastive Learning (SGL-style)** — two augmented views of the graph are
+   propagated through the shared LightGCN encoder, and an InfoNCE loss
+   (`src/popaware_training.py: info_nce`) pulls together the two embeddings of
+   the same user/item across views while pushing apart other in-batch
+   users/items, weighted by `λ_CL` with temperature `τ`.
+4. **Popularity-Aware Negative Sampling** — BPR negatives are optionally drawn
+   from a `Categorical(degree^β)` distribution instead of uniformly, so
+   popular items are sampled as negatives more often, which pushes them down
+   in the ranking. Implemented in `src/neg_sampling.py`
+   (`build_neg_probs`, `sample_bpr_batch_popaware`); `β = 0` recovers uniform
+   sampling.
+
+The four components can be toggled independently for ablation
+(`use_ile`, `aug_main`, `use_cl`, `neg_pop_beta` flags on
+`train_popaware_lightgcn(...)`), and are jointly optimized as
+`L = L_BPR + λ_ILE * L_ILE + λ_CL * L_CL + weight_decay * L2`.
+
+Baselines compared against (implemented outside this method's scope, by other
+team members / earlier notebook work):
+
+- `MostPopular` — non-personalized, ranks items by training popularity
+  (`src/baselines.py`).
+- `BPR-MF` — matrix factorization with BPR loss (`src/models.py`,
+  `src/losses.py`, `src/train.py`).
+- `LightGCN` — plain graph collaborative filtering, no debiasing
+  (`src/models.py`), used as the direct baseline for the proposed method.
+
+## Metrics
+
+All metrics are computed by full-ranking evaluation over the entire item
+catalog (masking out each user's train/val positives), implemented in
+`src/metrics.py: evaluate_full_ranking`. Ten metrics are reported at `K=10`
+and/or `K=20`:
+
+| Metric | Direction | Meaning |
+|---|---|---|
+| `Recall@K` | ↑ | Fraction of held-out positives retrieved in the top-K |
+| `NDCG@K` | ↑ | Rank-weighted retrieval quality |
+| `TailRecall@20` | ↑ | Recall restricted to tail-group items |
+| `Coverage@20` | ↑ | Fraction of the whole catalog that appears in any user's top-20 |
+| `ARP@20` | ↓ | Average Recommendation Popularity — mean training-degree of recommended items |
+| `TailExposure@20` | ↑ | Fraction of all top-20 slots (across users) filled by tail items |
+| `MiddleExposure@20` | — | Same, for middle-popularity items |
+| `HeadExposure@20` | ↓ | Same, for head (popular) items |
+
+`TailExposure + MiddleExposure + HeadExposure = 1` for every user, so these
+three always sum to 100% of recommendation slots.
 
 ## Repository Structure
 
 ```text
-graph-recommender-project/
-|-- notebooks/
-|   `-- main.ipynb
-|-- src/
-|   |-- __init__.py
-|   |-- config.py
-|   |-- data.py
-|   |-- metrics.py
-|   |-- baselines.py
-|   |-- models.py
-|   |-- losses.py
-|   |-- train.py
+TestSSH/
+|-- src/                          # reusable project code
+|   |-- config.py                 # single source of truth: hyperparameters, paths, seeding
+|   |-- data.py                   # original notebook-era data loader (parquet-based)
+|   |-- data_loader.py            # DataProcessor: loads cached tensors from preprocess_data/
+|   |-- metrics.py                # evaluate_full_ranking + the 10 metrics above
+|   |-- baselines.py              # MostPopular
+|   |-- models.py                 # BPR-MF, LightGCNRecommender
+|   |-- losses.py                 # BPR loss, L2 regularization
+|   |-- train.py                  # BPR-MF / LightGCN training loop (notebook path)
+|   |-- ile_losses.py             # ILE penalty + degree-aware dropout probabilities
+|   |-- ile_training.py           # earlier ILE-only training loop
+|   |-- neg_sampling.py           # popularity-aware negative sampling (deg^beta)
+|   |-- graph_augmentation.py     # graph augmentation utilities
+|   |-- popaware_training.py      # *** main method: train_popaware_lightgcn ***
+|   |-- pd_debias.py, pd_training.py   # explored/abandoned causal "Popularity Deconfounding" alternative
+|   |-- run_ile_experiments.py, run_augmentation_experiments.py  # earlier ablation runners (superseded)
 |   `-- plots.py
-|-- results/
-|-- figures/
+|-- preprocess_data/               # cached preprocessed tensors (train/val/test edges, degree, groups)
+|-- notebooks/
+|   `-- main.ipynb                 # data preprocessing + baseline integration notebook
+|-- train_all_popaware.py          # ablation runner: baseline / ile / degreeaug / degreeaug_cl / full
+|-- train_sweep_popaware.py        # hyperparameter grid sweep (layers x lambda_ILE x lambda_CL x beta)
+|-- train_final_seeds.py           # 3-seed (42, 0, 1) final numbers for 5 operating points
+|-- evaluate_test_full.py          # re-evaluate saved models on TEST with the full 10-metric set
+|-- run_on_gpu.sh                  # submit/monitor jobs on the remote A100 cluster via Slurm
+|-- ssh_config                     # example SSH ProxyJump config to reach the A100 cluster
+|-- checkpoints/popaware/          # <run_id>_latest.pt (resume) + <run_id>_best.pt (val-selected)
+|-- logs/popaware/                 # per-run training logs (<run_id>.log)
+|-- models/                        # final saved models, compatible with evaluate_test_full.py
+|-- results/                       # all CSV outputs (per-run, sweep, final mean+-std) + results/metrics/ (baseline reference numbers)
+|-- results/popaware/              # per-epoch training history CSVs (history_<run_id>.csv), for loss curves
+|-- PopAware_LightGCN_Documentation.md   # full Vietnamese technical report (method, results, analysis)
+|-- report_method_section.tex      # English LaTeX method + results section for the paper/report
 |-- requirements.txt
-|-- README.md
-`-- .gitignore
+`-- README.md
 ```
 
-- `notebooks/`: final integration and experiment notebooks. Start with `notebooks/main.ipynb`.
-- `src/`: reusable project code for data processing, metrics, baselines, models, losses, training, and plotting.
-- `results/`: saved metric tables, experiment outputs, and intermediate result files.
-- `figures/`: plots and visualizations used for analysis or presentation.
+Note: the repository also contains a number of one-off debugging/diagnostic
+scripts at the top level (`debug_*.py`, `test_*.py`, `fix_data_dtypes.py`,
+`comprehensive_fix.py`, etc.) created while chasing specific bugs (glob `**`
+crashes on the cluster's Python 3.11, PyTorch≥2.6 `weights_only` default,
+tensor dtype mismatches). They are not part of the training pipeline; the
+scripts listed above are the ones actually used to produce results.
+
+## Data
+
+Source: **MovieLens-1M**, placed under `data/MovieLens1M/`. Preprocessing
+(rating filter `>= 4`, user/item remapping, train/val/test split, training
+graph edge index, item degree, and popularity group) happens once in
+`notebooks/main.ipynb` and produces cached tensors in `preprocess_data/`
+(see `preprocess_data/README.md` for the exact schema):
+
+| File | Contents |
+|---|---|
+| `train_edges.pt` | `(563204, 2)` int64 — training `(user_id, item_id)` pairs |
+| `val_edges.pt` | `(6034, 2)` int64 — one held-out validation interaction per user |
+| `test_edges.pt` | `(6034, 2)` int64 — one held-out test interaction per user |
+| `edge_index_train.pt` | `(2, 1126408)` int64 — bidirectional PyG-style edge index for message passing |
+| `item_degree.pt` | `(3533,)` int64 — training-set degree per item |
+| `item_popularity_group.pt` | `(3533,)` int64 — `0=tail, 1=middle, 2=head` per item |
+| `metadata.pt` | `num_users`, `num_items`, and related metadata |
+
+`src/data_loader.py: DataProcessor` loads these cached tensors directly (with
+`torch.load(..., weights_only=False)`, safe because the files are produced by
+this project itself). All training/evaluation scripts use this loader — the
+training graph must only ever contain training edges; validation/test edges
+must never be used for message passing, and item degree/popularity groups are
+computed purely from training interactions.
 
 ## Environment Setup
 
-From Windows PowerShell, create and activate a virtual environment:
+From Windows PowerShell:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-```
-
-If PowerShell blocks script activation for the current session, run:
-
-```powershell
+# if execution policy blocks activation for this session:
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
-```
 
-Install dependencies:
-
-```powershell
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-Optional notebook kernel setup:
+Key dependencies (`requirements.txt`): `numpy`, `pandas`, `torch>=2.3`,
+`torch-geometric>=2.5`, `scikit-learn`, `matplotlib`, `tqdm`,
+`ipykernel`/`jupyterlab` for notebook work.
 
-```powershell
-python -m ipykernel install --user --name graph-ml --display-name "Python (Graph ML)"
+## Remote GPU Workflow (A100 cluster)
+
+**All training and evaluation must run on the remote A100 GPU server, never
+on the local laptop.** Code is kept in sync between this Windows machine and
+the cluster via Mutagen two-way sync (see `.mutagen`/session named
+`testssh`); `run_on_gpu.sh` flushes that sync before every remote command.
+
+```bash
+./run_on_gpu.sh <script.py> [args...]     # quick run on the login node (no Slurm) — smoke tests only
+./run_on_gpu.sh --train <script.py>       # submit a real training job via Slurm (sbatch) on the A100
+./run_on_gpu.sh --status                  # squeue -u $USER
+./run_on_gpu.sh --log [jobid]             # tail slurm-<jobid>.out (latest job if jobid omitted)
+./run_on_gpu.sh --cancel <jobid>          # scancel a job
 ```
 
-Google Colab can also be used. If using Colab, upload or mount the repository and install the dependencies inside the notebook runtime.
+SSH connectivity uses a `ProxyJump` through an intermediate host to reach the
+A100 box (`a100-B`); see `ssh_config` for the connection pattern (copy it
+into `~/.ssh/config` with your own credentials — do not commit real
+passwords/keys).
 
-## How To Run The Project
+Caution: since sync is two-way, an empty local mirror of a directory (e.g.
+`checkpoints/`) can cause Mutagen to delete the corresponding files on the
+cluster. Do not delete or recreate top-level tracked directories without
+checking sync status first.
 
-1. Open `notebooks/main.ipynb` in Jupyter, VS Code, Kaggle, or Colab.
-2. Select the project virtual environment kernel, for example `Python (Graph ML)`.
-3. Run the setup/import cells.
-4. Run the preprocessing cells to load MovieLens 1M, keep ratings `>= 4`, remap users/items, and create train/validation/test splits.
-5. Run the `MostPopular` evaluation pipeline.
-6. Later notebook sections will run BPR-MF, LightGCN, and LightGCN + ILE after those implementations are added.
+## How to Run
 
-## Current Progress
+1. **Preprocess data** (one-time): run the preprocessing cells in
+   `notebooks/main.ipynb` to generate the tensors under `preprocess_data/`.
+2. **Ablation run** (baseline vs. each method component vs. full method):
+   ```bash
+   ./run_on_gpu.sh --train train_all_popaware.py
+   # or a subset / smoke test:
+   ./run_on_gpu.sh train_all_popaware.py --configs baseline,ile --epochs 5
+   ```
+3. **Hyperparameter sweep** (`num_layers x lambda_ILE x lambda_CL x beta`):
+   ```bash
+   ./run_on_gpu.sh --train train_sweep_popaware.py
+   ```
+4. **Final 3-seed numbers** for the reported operating points (baseline +
+   4 PopAware configurations, seeds `42, 0, 1`):
+   ```bash
+   ./run_on_gpu.sh --train train_final_seeds.py
+   ```
+5. **Re-evaluate saved models** on TEST with the complete 10-metric set
+   (does not retrain; reads from `models/final_model_*.pt`):
+   ```bash
+   ./run_on_gpu.sh evaluate_test_full.py
+   ```
 
-- Repository structure initialized.
-- Main notebook created.
-- Preprocessing pipeline prepared.
-- Evaluation metrics implemented in `src/metrics.py`.
-- `MostPopular` baseline implemented in `src/baselines.py`.
-- Next steps: implement BPR-MF, LightGCN, and LightGCN + ILE.
+Every training run (`train_popaware_lightgcn` in `src/popaware_training.py`)
+automatically:
+
+- selects the model checkpoint by **validation** Recall@K only, and touches
+  the **test** set exactly once at the end (no leakage);
+- writes `<run_id>_latest.pt` (for resume) and `<run_id>_best.pt` (best
+  validation score so far) to `checkpoints/popaware/`;
+- resumes automatically from `<run_id>_latest.pt` if present (unless
+  `--no-resume` is passed);
+- logs every epoch to stdout and to `logs/popaware/<run_id>.log`;
+- appends per-epoch metrics to `results/popaware/history_<run_id>.csv`.
+
+## Results
+
+Reference baselines (`results/metrics/main_results.csv`, K=20):
+
+| Model | Recall@20 ↑ | NDCG@20 ↑ | TailRecall@20 ↑ | Coverage@20 ↑ | ARP@20 ↓ | HeadExposure@20 ↓ |
+|---|---|---|---|---|---|---|
+| MostPopular | 0.0723 | 0.0269 | 0.0000 | 0.0498 | 7.529 | 1.0000 |
+| BPR-MF | 0.1309 | 0.0511 | 0.0109 | 0.6281 | 6.518 | 0.8774 |
+| LightGCN (baseline) | 0.1276 | 0.0492 | 0.0036 | 0.3971 | 6.856 | 0.9594 |
+
+Final 3-seed results for Popularity-Aware LightGCN
+(`results/popaware_final_meanstd_20260715_174317.csv`, mean ± std over seeds
+`{42, 0, 1}`, `num_layers=2`, K=20):
+
+| Model | Recall@20 ↑ | NDCG@20 ↑ | TailRecall@20 ↑ | Coverage@20 ↑ | ARP@20 ↓ | HeadExposure@20 ↓ |
+|---|---|---|---|---|---|---|
+| LightGCN (baseline) | 0.1287 ± 0.0005 | 0.0497 ± 0.0002 | 0.0050 ± 0.0009 | 0.3978 ± 0.0043 | 6.833 ± 0.009 | 0.9587 ± 0.0006 |
+| PopAware-accuracy | 0.1367 ± 0.0035 | 0.0527 ± 0.0006 | 0.0143 ± 0.0023 | 0.4619 ± 0.0289 | 6.500 ± 0.051 | 0.9171 ± 0.0144 |
+| PopAware-BEST | 0.1338 ± 0.0030 | 0.0518 ± 0.0004 | 0.0324 ± 0.0049 | 0.5384 ± 0.0293 | 6.400 ± 0.042 | 0.8826 ± 0.0114 |
+| PopAware-high-tail | 0.1352 ± 0.0020 | 0.0524 ± 0.0004 | 0.0399 ± 0.0023 | 0.4990 ± 0.0099 | 6.564 ± 0.008 | 0.9117 ± 0.0005 |
+| PopAware-fairness | 0.1052 ± 0.0039 | 0.0415 ± 0.0011 | 0.0274 ± 0.0035 | 0.7135 ± 0.0027 | 6.138 ± 0.001 | 0.8333 ± 0.0016 |
+
+The four `PopAware-*` rows are named operating points on an
+accuracy/fairness frontier (hyperparameters in `train_final_seeds.py`), all
+using `use_ile=True, use_cl=True`, varying `λ_ILE`, `λ_CL`, and the negative
+sampling exponent `β`:
+
+- **accuracy** (`λ_ILE=0.1, λ_CL=0.1, β=0.5`): best Recall/NDCG among the
+  PopAware configs, still a meaningful tail-recall/coverage gain over
+  baseline.
+- **BEST** (`λ_ILE=1.0, λ_CL=0.1, β=0.5`): the balanced pick — large bias
+  reduction with accuracy close to baseline.
+- **high-tail** (`λ_ILE=1.0, λ_CL=0.1, β=0.0`): highest `TailRecall@20` while
+  still improving (not hurting) `Recall@20`.
+- **fairness** (`λ_ILE=1.0, λ_CL=0.5, β=0.0`): strongest bias reduction
+  (`Coverage@20` up to 0.71, `HeadExposure@20` down to 0.83) at the cost of
+  a real accuracy drop.
+
+All four PopAware operating points improve every bias metric over the
+LightGCN baseline (`TailRecall@20`, `Coverage@20` up; `ARP@20`,
+`HeadExposure@20` down), and three of the four (`accuracy`, `BEST`,
+`high-tail`) do so while simultaneously *improving* Recall@20/NDCG@20 rather
+than trading them away — only the `fairness` point sacrifices accuracy for
+the strongest debiasing. See `results/popaware_sweep_20260715_155058.csv` for
+the full 24-point hyperparameter grid and
+`PopAware_LightGCN_Documentation.md` / `report_method_section.tex` for full
+analysis, statistical-significance checks, and a best-seed supplementary
+table.
+
+## Reproducibility Notes
+
+- Seeding: `src/config.py: set_seed()` seeds Python/NumPy/PyTorch (CPU+CUDA)
+  and enables deterministic cuDNN; call it at the start of every script,
+  before building any model or shuffling data.
+- Final numbers are reported as mean ± std over 3 seeds (`42, 0, 1`), not a
+  single best-seed run, to avoid selection bias ("winner's curse") in the
+  headline comparison. A best-seed supplementary table is provided separately
+  in the documentation, explicitly labeled as such.
+- Model selection strictly uses the **validation** set; the **test** set is
+  evaluated exactly once, at the end of training.
+
+## Documentation
+
+- [`PopAware_LightGCN_Documentation.md`](PopAware_LightGCN_Documentation.md) —
+  full Vietnamese technical report: problem/motivation, data, metrics,
+  method formulas, training setup, experimental design, results tables
+  (mean±std, significance, best-seed), architecture/frontier diagrams,
+  analysis vs. expectations, limitations, conclusion, and a slide-ready
+  summary table.
+- [`report_method_section.tex`](report_method_section.tex) — English LaTeX
+  write-up of the proposed method, implementation details, hyperparameters,
+  and results section, for inclusion in the course report.
 
 ## Team Workflow
 
-- Avoid having multiple people edit `notebooks/main.ipynb` at the same time because notebook merge conflicts are difficult to resolve.
-- Team members should mainly work in separate files under `src/`.
-- Keep reusable logic out of the notebook when possible.
-- Use `notebooks/main.ipynb` as the final integration and experiment file.
-- Save generated outputs in `results/` and plots in `figures/`.
-
-## Notes
-
-- The training graph must use only training edges.
-- Validation and test edges must not be used for graph message passing.
-- Item popularity, item groups, and item degree should be computed from training interactions only.
-- All models should output a score matrix with shape `[num_users, num_items]`.
-- All models should be evaluated using the shared `evaluate_full_ranking` function from `src/metrics.py`.
+- Avoid multiple people editing `notebooks/main.ipynb` simultaneously —
+  notebook merge conflicts are hard to resolve.
+- Keep reusable logic in `src/`, not in the notebook.
+- Save generated outputs to `results/` and plots to `figures/`.
+- Training always runs on the remote A100 cluster via `run_on_gpu.sh` — never
+  directly on a local machine.
