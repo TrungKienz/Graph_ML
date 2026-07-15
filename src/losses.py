@@ -86,10 +86,33 @@ def l2_regularization(*embeddings: torch.Tensor, batch_size: int | None = None) 
     """
     reg = pos = None
     for emb in embeddings:
-        term = emb.pow(2).sum()
+        # CRITICAL FIX: Ensure input is actually a tensor
+        if not isinstance(emb, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor, got {type(emb)}: {emb}")
+        
+        # CRITICAL FIX: Ensure embedding is float before pow operation
+        emb_float = emb.float() if emb.dtype != torch.float32 else emb
+        
+        # CRITICAL FIX: Add numerical stability check
+        if not torch.all(torch.isfinite(emb_float)):
+            print(f"⚠️  Warning: Non-finite values in embedding tensor")
+            emb_float = torch.nan_to_num(emb_float, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        term = emb_float.pow(2).sum()
+        
+        # CRITICAL FIX: Validate term is finite
+        if not torch.isfinite(term):
+            print(f"⚠️  Warning: Non-finite regularization term, setting to 0")
+            term = torch.tensor(0.0, device=emb.device, dtype=torch.float32)
+        
         reg = term if reg is None else reg + term
+        
     if reg is None:
         raise ValueError("l2_regularization requires at least one embedding tensor")
     if batch_size is not None:
-        reg = reg / batch_size
+        # CRITICAL FIX: Validate batch_size is valid
+        if isinstance(batch_size, int) and batch_size > 0:
+            reg = reg / batch_size
+        else:
+            print(f"⚠️  Warning: Invalid batch_size {batch_size}, skipping normalization")
     return reg

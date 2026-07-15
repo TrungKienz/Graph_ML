@@ -1,0 +1,4 @@
+12:27:37 | 🚀 [full_L3_seed42] ILE=True(λ=1.0) aug_main=False CL=True(λ=0.1,τ=0.2) negβ=0.5 drop=degree_aware layers=3 epochs=2 steps/epoch=137 device=cpu
+12:29:43 | ep   1 | 126.3s | BPR=0.6928 ILE=0.0000 CL=5.5819
+12:31:52 | ep   2 | 128.6s | BPR=0.6926 ILE=0.0000 CL=5.5724 | VAL Recall@20=0.0154 Cov=0.9779 ARP=4.8791 TailRec=0.0000 ⭐best
+12:31:52 | ✅ [full_L3_seed42] TEST Recall@20=0.0162 NDCG@20=0.0063 TailRec=0.0019 Cov=0.9779 ARP=4.8780 HeadExp=0.3807

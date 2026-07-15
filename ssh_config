@@ -1,0 +1,19 @@
+# SSH config: laptop -> may trung gian A -> GPU server B (A100)
+# Thay cac gia tri User/HostName ben duoi bang thong tin that cua ban.
+# Khong luu password trong file nay - dung ssh-copy-id de dang nhap bang key.
+#
+# Cach dung: copy noi dung file nay vao ~/.ssh/config (hoac them vao cuoi file do neu da co san),
+# roi chay: ssh a100-B
+
+Host trunggian-A
+    HostName 119.17.198.75
+    User ioithpc1
+    Port 22
+    IdentityFile ~/.ssh/id_ed25519
+
+Host a100-B
+    HostName 172.18.104.104
+    User giangnl
+    Port 22
+    ProxyJump trunggian-A
+    IdentityFile ~/.ssh/id_ed25519
