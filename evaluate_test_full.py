@@ -67,9 +67,12 @@ def find_final_models(models_dir: Path) -> list[Path]:
         raise FileNotFoundError(f"Không có file final_model_*.pt nào trong {models_dir}")
 
     # Nếu một model_name có nhiều bản (train nhiều lần), giữ bản mới nhất theo mtime.
+    # weights_only=False: PyTorch>=2.6 mặc định True làm hỏng việc nạp file .pt chứa
+    # numpy scalar/metadata (giống lý do trong src/data_loader.py). File do chính
+    # project sinh ra (tin cậy) nên an toàn.
     latest: dict[str, Path] = {}
     for f in files:
-        pkg = torch.load(f, map_location="cpu")
+        pkg = torch.load(f, map_location="cpu", weights_only=False)
         name = pkg.get("metadata", {}).get("model_name") or f.stem
         if name not in latest or f.stat().st_mtime > latest[name].stat().st_mtime:
             latest[name] = f
@@ -78,7 +81,7 @@ def find_final_models(models_dir: Path) -> list[Path]:
 
 def load_model(path: Path, data: DataProcessor, device: torch.device):
     """Nạp LightGCN từ package đã lưu, dùng đúng embedding_dim/num_layers lúc train."""
-    pkg = torch.load(path, map_location=device)
+    pkg = torch.load(path, map_location=device, weights_only=False)
     cfg = pkg.get("config", {})
     meta = pkg.get("metadata", {})
 

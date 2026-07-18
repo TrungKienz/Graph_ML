@@ -253,14 +253,32 @@ checking sync status first.
    `results/full_test_metrics_<timestamp>.csv` and
    `results/full_comparison_<timestamp>.csv` — this is the main "show me the
    numbers" step after training.
-6. **Build the final results table** (Markdown + LaTeX, matching the
+6. **Qualitative demo** — see real movie-title recommendations for one user
+   (does not retrain; reads from `models/final_model_*.pt`):
+   ```bash
+   python demo_recommend.py                     # random user with a held-out test item
+   python demo_recommend.py --user 42 --k 20    # a specific user_idx, top-20
+   ./run_on_gpu.sh demo_recommend.py --user 42  # on the cluster (CPU is enough)
+   ```
+   Prints the movies that user actually watched (with their own ratings), the
+   held-out test movie, and the top-K titles the model recommends (each
+   tagged 🌳 head / 🌿 middle / 🌱 tail), plus a head/tail count for that
+   list — a quick visual read on popularity bias for a single user, to
+   complement the aggregate metrics from step 5. `preprocess_data/` only
+   stores re-indexed `movie_idx`, not the original MovieLens `MovieID`, so
+   this script rebuilds the `movie_idx -> title` mapping straight from
+   `data/MovieLens1M/raw/*.dat` and **cross-checks every reconstructed
+   `(user, item)` pair against the cached `train/val/test_edges.pt` before
+   printing anything** — it refuses to run if the reconstruction doesn't
+   match exactly, rather than risk showing a wrong title.
+7. **Build the final results table** (Markdown + LaTeX, matching the
    [Results](#results) tables below) from `results/metrics/main_results.csv`
    and the newest `results/popaware_final_meanstd_*.csv`:
    ```bash
    python -c "from src.make_table import main; main()"
    ```
    Writes `results/main_results_table.md` and `results/main_results_table.tex`.
-7. **Generate report figures** (item degree distribution, popularity group
+8. **Generate report figures** (item degree distribution, popularity group
    sizes, Recall-vs-TailRecall trade-off, Coverage by model, Head/Middle/Tail
    exposure by model, training loss curves) via `src/plots.py`. This module is
    a library of plotting functions (no CLI), so call the ones you need
@@ -296,12 +314,6 @@ checking sync status first.
    needs the per-epoch `results/popaware/history_<run_id>.csv` written by
    whichever training run(s) you want to plot. All PNGs are saved under
    `figures/`.
-
-**Note — no title-level recommendation demo:** the pipeline above only ever
-produces aggregate metrics and figures, never a human-readable "here is what
-we recommend to user X, by movie title" list. There is currently no script
-that maps a user's top-K item indices back to `data/MovieLens1M/raw/movies.dat`
-titles for a qualitative demo; everything is evaluated purely numerically.
 
 Every training run (`train_popaware_lightgcn` in `src/popaware_training.py`)
 automatically:
