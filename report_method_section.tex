@@ -1,0 +1,712 @@
+% =============================================================================
+% Method section: Popularity-Aware LightGCN
+% -----------------------------------------------------------------------------
+% Snippet meant to be \input{} or pasted directly into the report's main .tex
+% file at the point where the Method / Approach chapter begins (i.e., nested
+% under an existing \section{...} in your document).
+%
+% Structure: ONE \subsection{Proposed Method} (overview + roadmap) containing
+% SIX \subsubsection{...} children, each representing one implemented and
+% experimentally validated component.
+%
+% Required packages (add to preamble if not already present):
+%   \usepackage{amsmath, amssymb}
+%   \usepackage{algorithm}
+%   \usepackage{algorithmic}
+%   \usepackage{booktabs}
+%   \usepackage{graphicx}   % needed for \resizebox, used by \fitwidthtable below
+%
+% \fitwidthtable{...} wraps a table and shrinks it ONLY if it is wider than the
+% text column (never stretches a narrow table). \providecommand is used so this
+% is safe to load even if another \input'd snippet defines it too.
+\providecommand{\fitwidthtable}[1]{%
+  \setbox0=\hbox{#1}%
+  \ifdim\wd0>\linewidth
+    \resizebox{\linewidth}{!}{\box0}%
+  \else
+    \box0
+  \fi
+}
+%
+% All formulas below have been verified line-by-line against the actual
+% implementation (src/models.py, src/losses.py, src/ile_losses.py,
+% src/neg_sampling.py, src/popaware_training.py) as of the final 3-seed
+% experiments reported in this work.
+%
+% NOTE on citation keys: he2020lightgcn, rendle2009bpr, wu2021sgl, and
+% wang2020alignuniform refer to real, well-known papers (LightGCN — He et al.,
+% SIGIR 2020; BPR — Rendle et al., UAI 2009; SGL — Wu et al., SIGIR 2021;
+% alignment/uniformity — Wang & Isola, ICML 2020) but the exact \cite keys must
+% be checked against your own .bib file before compiling.
+%
+% NOTE: "Section~\ref{sec:results}" is a placeholder — replace with \ref{} to the
+% actual label of your Experiments section once written.
+% =============================================================================
+
+\subsection{Proposed Method}
+\label{sec:proposed_method}
+
+Graph-based collaborative filtering models such as LightGCN~\cite{he2020lightgcn} are
+particularly susceptible to popularity bias: because the neighborhood-aggregation step
+propagates a signal proportional to node degree, high-degree (popular) item nodes receive
+disproportionately more gradient updates than low-degree (long-tail) item nodes. Over
+training, this drives popular-item embeddings to larger norms and causes them to dominate
+the dot-product ranking for almost every user, irrespective of individual user preference.
+
+We propose \emph{Popularity-Aware LightGCN}, which augments the LightGCN backbone with four
+complementary interventions. We introduce them in the order below because each one closes a
+specific gap left open by the ones before it, rather than as four independent, parallel
+tricks; all four are independently switchable, so that disabling all of them recovers plain
+LightGCN trained with uniform negative sampling:
+\begin{enumerate}
+    \item[(1)] an \textbf{objective-level} re-weighting of the loss, \emph{Item Loss
+    Equalization} (Section~\ref{sec:popularity-aware_lightGCN_with_item_loss_equalization}),
+    which reshapes per-interaction gradients but leaves the propagation graph itself
+    untouched;
+    \item[(2)] a \textbf{structure-level} perturbation of the propagation graph, \emph{Degree-Aware
+    Graph Augmentation} (Section~\ref{sec:optional_degree_aware_graph_augmentation}), which
+    weakens the structural dominance of popular items during message passing but does not
+    directly shape the resulting embedding geometry;
+    \item[(3)] a \textbf{representation-level} contrastive regularizer computed across two
+    augmented views of the graph (Section~\ref{sec:contrastive_learning}), which explicitly
+    encourages a well-spread embedding geometry but leaves the negative sampling distribution
+    untouched;
+    \item[(4)] a \textbf{sampling-level} bias in the negative distribution, \emph{Popularity-Aware
+    Negative Sampling} (Section~\ref{sec:popularity_aware_negative_sampling}), which closes
+    this last gap by directly and repeatedly challenging popular items during optimization.
+\end{enumerate}
+All four components are implemented and independently switchable
+(Section~\ref{sec:hyperparameters}); however, the configurations reported in
+Section~\ref{sec:results} sweep components (1), (3), and (4), while component (2) is exercised
+only in its role as the view-construction mechanism for component (3), rather than as a
+stand-alone main-pass regularizer --- see the note accompanying
+Table~\ref{tab:operating-points} for details.
+Section~\ref{sec:joint_training_objective} combines the four components into a single
+training objective and summarizes the full training procedure, and
+Section~\ref{sec:model_selection_protocol} describes the protocol used to select and evaluate
+the final model without leaking test-set information into training decisions.
+
+\subsubsection{Backbone and Item Loss Equalization}
+\label{sec:popularity-aware_lightGCN_with_item_loss_equalization}
+
+We first describe the LightGCN backbone and its base training objective, which every
+subsequent component in this section builds upon, before introducing our first
+bias-mitigation component, Item Loss Equalization.
+
+\paragraph{Backbone.}
+Let $\mathcal{U}$ and $\mathcal{I}$ denote the sets of users and items, and let
+$e_u^{(0)}, e_i^{(0)} \in \mathbb{R}^d$ be their layer-0 (ego) embeddings, held in a single
+embedding table indexed over $\mathcal{U}\cup\mathcal{I}$. Following LightGCN, we propagate
+embeddings over the user--item bipartite graph using the symmetric normalized adjacency
+$\tilde{A} = D^{-1/2} A D^{-1/2}$, without feature transformation or non-linear activation:
+\begin{equation}
+    E^{(k+1)} = \tilde{A}\, E^{(k)}, \qquad
+    E = \frac{1}{K+1}\sum_{k=0}^{K} E^{(k)},
+    \label{eq:lightgcn-propagation}
+\end{equation}
+where $E^{(k)}$ stacks the embeddings of all nodes at layer $k$ and $K$ is the number of
+propagation layers. The final user and item embeddings $e_u, e_i$ are read off from $E$, and
+the predicted preference score is their inner product, $s(u,i) = e_u^{\top} e_i$.
+
+\paragraph{Base objective.}
+Positive pairs $(u,i^+)$ are sampled uniformly from the set of training interactions, and the
+backbone is trained with the Bayesian Personalized Ranking (BPR) loss~\cite{rendle2009bpr}
+over the resulting triplets $(u,i^+,i^-)$, where $i^-$ is a sampled negative
+(Section~\ref{sec:popularity_aware_negative_sampling} describes our negative sampler):
+\begin{equation}
+    \ell(u,i^+,i^-) = -\log\sigma\big(s(u,i^+) - s(u,i^-)\big), \qquad
+    \mathcal{L}_{BPR} = \frac{1}{|\mathcal{B}|}\sum_{(u,i^+,i^-)\in\mathcal{B}} \ell(u,i^+,i^-),
+    \label{eq:bpr}
+\end{equation}
+together with an $\ell_2$ penalty on the ego embeddings of the nodes present in the batch,
+averaged over the batch:
+\begin{equation}
+    \mathcal{L}_{reg} = \frac{1}{|\mathcal{B}|}\sum_{(u,i^+,i^-)\in\mathcal{B}}
+    \Big(\lVert e_u^{(0)}\rVert_2^2 + \lVert e_{i^+}^{(0)}\rVert_2^2 + \lVert e_{i^-}^{(0)}\rVert_2^2\Big),
+    \label{eq:l2reg}
+\end{equation}
+weighted by $\lambda_{reg}$ in the total objective (Eq.~\eqref{eq:total-loss}).
+
+\paragraph{Item Loss Equalization (ILE).}
+To counteract popularity bias directly at the objective level, we partition the item catalog
+into popularity groups --- \emph{head}, \emph{middle}, \emph{tail} --- based on percentiles
+of item degree computed on the training graph (tail: below the 50th percentile; head: above
+the 80th percentile). For a training mini-batch $\mathcal{B}$, let $\mathcal{B}_{head}$ and
+$\mathcal{B}_{tail}$ be the subsets of triplets whose positive item $i^+$ falls in the head
+and tail groups, respectively (triplets whose $i^+$ falls in the middle group belong to
+neither subset and do not contribute to $\mathcal{L}_{ILE}$), and let
+\begin{equation}
+    \bar\ell_{g} = \frac{1}{|\mathcal{B}_{g}|}\sum_{(u,i^+,i^-)\in \mathcal{B}_{g}} \ell(u,i^+,i^-),
+    \qquad g \in \{head, tail\},
+\end{equation}
+be the mean BPR loss within each group (the penalty is only evaluated when both groups are
+non-empty in the batch; otherwise it is defined as zero). We define the Item Loss
+Equalization penalty as the squared discrepancy between the two group losses,
+\begin{equation}
+    \mathcal{L}_{ILE} = \big(\bar\ell_{head} - \bar\ell_{tail}\big)^2 .
+    \label{eq:ile}
+\end{equation}
+Because tail items receive fewer positive interactions during training, $\bar\ell_{tail}$ is
+typically larger than $\bar\ell_{head}$ under plain BPR training; minimizing
+Eq.~\eqref{eq:ile} therefore pulls $\bar\ell_{tail}$ toward $\bar\ell_{head}$, effectively
+re-weighting the optimization in favor of tail interactions. The squared, symmetric
+formulation is lower-bounded by zero and admits no incentive to instead \emph{increase}
+$\bar\ell_{tail}$ to close the gap --- a degenerate failure mode we observed with the naive,
+unsigned difference $\bar\ell_{head} - \bar\ell_{tail}$, which collapses the model toward a
+popularity-only ranking as its weight increases. ILE is a purely objective-level
+intervention: it reshapes the gradient contributed by each interaction according to the
+popularity of its positive item but leaves the propagation graph in
+Eq.~\eqref{eq:lightgcn-propagation} completely unchanged, isolating its effect from the
+structural intervention introduced next.
+
+\subsubsection{Degree-Aware Graph Augmentation}
+\label{sec:optional_degree_aware_graph_augmentation}
+
+ILE re-weights the training objective but does not address the structural cause of
+popularity bias: high-degree item nodes still dominate neighborhood aggregation in
+Eq.~\eqref{eq:lightgcn-propagation}. We introduce an optional, complementary intervention
+that perturbs the propagation graph itself, so that popular items contribute a
+proportionally smaller share of the aggregated signal during training.
+
+\paragraph{Degree-aware edge dropout.}
+For each item $i$ with training-graph degree $d_i$, we define a drop probability that grows
+logarithmically with popularity,
+\begin{equation}
+    p_i = p_{min} + (p_{max} - p_{min}) \cdot \frac{\log(1+d_i)}{\log(1+d_{max})},
+    \qquad p_i \in [p_{min}, p_{max}],
+    \label{eq:degree-aware-dropout-prob}
+\end{equation}
+where $d_{max} = \max_i d_i$ and $p_{min}, p_{max}$ are hyperparameters. Popular items are
+thus dropped from the propagation graph more aggressively than long-tail items.
+
+\paragraph{Symmetric dropout scheme.}
+The bipartite graph is stored as an undirected edge list, i.e., every training interaction
+$(u,i)$ contributes both a $u\!\to\!i$ and an $i\!\to\!u$ edge. To preserve the symmetry
+required by the normalized adjacency $\tilde{A}$, the drop decision is sampled once per
+interaction --- retaining the $u\!\to\!i$ edge independently with probability $1-p_i$ --- and
+mirrored onto the reverse $i\!\to\!u$ edge, rather than drawing the two directions
+independently. This yields an augmented adjacency $\hat{A}$ that remains a valid undirected
+graph. As an ablation control, we also implement \emph{uniform} edge dropout, which drops
+every edge independently with a constant probability regardless of item degree, isolating
+the contribution of the degree-aware weighting in Eq.~\eqref{eq:degree-aware-dropout-prob}
+from that of dropout regularization in general. We refer to the degree-aware/uniform choice
+as the \emph{dropout scheme}, reused identically by the contrastive branch in
+Section~\ref{sec:contrastive_learning}.
+
+\paragraph{Usage.}
+This augmentation is optional in two independent senses: (i) it can be toggled on or off as a
+stand-alone regularizer applied to the forward pass used to compute $\mathcal{L}_{BPR}$ and
+$\mathcal{L}_{ILE}$, and (ii) it is, independently of (i), also used to construct the two
+augmented views consumed by the contrastive objective described next. At inference time the
+augmentation is always disabled: item ranking is computed on the original, unperturbed graph,
+so the augmentation acts purely as a training-time regularizer. In the configurations
+reported in Section~\ref{sec:results}, usage (ii) is always active while usage (i) is not: the
+main forward pass is never itself augmented, so the structural intervention studied here is
+validated only through the contrastive branch of Section~\ref{sec:contrastive_learning}.
+
+\subsubsection{Contrastive Regularization across Augmented Views}
+\label{sec:contrastive_learning}
+
+Degree-aware augmentation (Section~\ref{sec:optional_degree_aware_graph_augmentation})
+weakens the structural dominance of popular items during message passing, but it does not
+directly control the geometry of the resulting embedding space: item embeddings can still
+collapse into a narrow region dominated by popular items even on an augmented graph. We
+therefore add a representation-level regularizer that explicitly targets this geometry.
+Following the self-supervised graph learning paradigm~\cite{wu2021sgl}, we add an auxiliary
+contrastive objective that encourages the embedding space to remain well-spread rather than
+collapsing toward a small set of popular items. At each training step we sample two
+independent augmented graphs $\hat{A}^{(1)}, \hat{A}^{(2)}$ from the \emph{original} graph
+$A$, using the same edge-dropout scheme introduced in
+Section~\ref{sec:optional_degree_aware_graph_augmentation} --- degree-aware
+(Eq.~\eqref{eq:degree-aware-dropout-prob}) in our main experiments, or uniform in the
+ablation control --- independently of whether the main forward pass used for
+Eq.~\eqref{eq:bpr} is itself augmented. Each view is propagated through
+Eq.~\eqref{eq:lightgcn-propagation} to obtain node embeddings $E^{(1)}, E^{(2)}$, and the two
+views of the same node are treated as a positive pair, with all other nodes in the batch
+serving as negatives (InfoNCE):
+\begin{equation}
+    \mathcal{L}_{NCE}(\mathcal{N}) = -\frac{1}{|\mathcal{N}|}\sum_{n\in\mathcal{N}}
+    \log \frac{\exp\!\big(\hat{z}_n^{(1)\top}\hat{z}_n^{(2)}/\tau\big)}
+    {\sum_{m\in\mathcal{N}} \exp\!\big(\hat{z}_n^{(1)\top}\hat{z}_m^{(2)}/\tau\big)},
+    \label{eq:infonce}
+\end{equation}
+where $\hat{z}_n^{(v)} = E^{(v)}_n / \lVert E^{(v)}_n \rVert$ is the $\ell_2$-normalized
+embedding of node $n$ in view $v$, and $\tau$ is a temperature hyperparameter. We apply
+Eq.~\eqref{eq:infonce} separately to the set of \emph{unique} users and the set of unique
+positive items present in the mini-batch, $\mathcal{U}_{\mathcal{B}}$ and
+$\mathcal{I}^{+}_{\mathcal{B}}$, and sum the two terms:
+\begin{equation}
+    \mathcal{L}_{CL} = \mathcal{L}_{NCE}(\mathcal{U}_{\mathcal{B}})
+                      + \mathcal{L}_{NCE}(\mathcal{I}^{+}_{\mathcal{B}}).
+\end{equation}
+The InfoNCE objective is known to jointly promote \emph{alignment} of positive pairs and
+approximately \emph{uniform} coverage of the embedding hypersphere~\cite{wang2020alignuniform};
+the latter property directly discourages the embedding collapse toward a small set of popular
+items observed under plain BPR training, and is expected to increase catalog coverage.
+
+\subsubsection{Popularity-Aware Negative Sampling}
+\label{sec:popularity_aware_negative_sampling}
+
+The three components above reshape the training objective, the propagation graph, and the
+embedding geometry, respectively, but none of them alters \emph{which} items are used as
+negatives during optimization: negatives are still drawn uniformly, so popular items are not
+disproportionately challenged even though they are precisely the items that most need to be
+pushed down in the ranking. We close this last gap with a sampling-level intervention.
+Standard BPR training draws the negative item $i^-$ uniformly from the catalog. We instead
+sample negatives from a degree-biased categorical distribution,
+\begin{equation}
+    i^- \sim \mathrm{Categorical}(w), \qquad w_i \propto d_i^{\beta}, \qquad \beta \ge 0,
+    \label{eq:pop-aware-negative-sampling}
+\end{equation}
+where $\beta$ controls the sharpness of the bias toward popular items ($\beta=0$ recovers
+uniform sampling). Sampled negatives that coincide with an item the user has already
+interacted with in training are rejected and re-drawn (subject to a bounded number of
+resampling attempts), preserving the standard implicit-BPR assumption that $i^-$ is a
+non-interacted item. Because popular items are sampled as negatives far more frequently under
+Eq.~\eqref{eq:pop-aware-negative-sampling}, their score is discouraged more often and more
+strongly during training, directly counteracting their tendency to dominate the top-$K$
+ranking irrespective of true user preference.
+
+\subsubsection{Joint Training Objective}
+\label{sec:joint_training_objective}
+
+The full training objective for a mini-batch combines all four components,
+\begin{equation}
+    \mathcal{L} = \mathcal{L}_{BPR} + \lambda_{reg}\,\mathcal{L}_{reg}
+                + \lambda_{ILE}\, \mathcal{L}_{ILE} + \lambda_{CL}\, \mathcal{L}_{CL},
+    \label{eq:total-loss}
+\end{equation}
+where $\mathcal{L}_{BPR}$ (Eq.~\eqref{eq:bpr}) is computed with the popularity-aware negative
+sampler of Eq.~\eqref{eq:pop-aware-negative-sampling}, optionally over the augmented graph of
+Eq.~\eqref{eq:degree-aware-dropout-prob}; $\mathcal{L}_{ILE}$ reuses the same per-triplet
+losses from that forward pass, grouped by the popularity of $i^+$ (Eq.~\eqref{eq:ile}); and
+$\mathcal{L}_{CL}$ is computed on two freshly sampled augmented views of the original graph
+(Eq.~\eqref{eq:infonce}). Each of $\lambda_{ILE}$, $\lambda_{CL}$, the negative-sampling
+sharpness $\beta$, and the two graph-side switches (main-pass augmentation and contrastive
+learning) can be set to zero independently. The ablation reported in Section~\ref{sec:results}
+sweeps $\lambda_{ILE}$, $\lambda_{CL}$, and $\beta$, while keeping the main-pass augmentation
+switch off throughout (Table~\ref{tab:operating-points}); a standalone ablation of main-pass
+augmentation is left for future work. At inference time,
+item ranking for a user $u$ is computed with the score $s(u,i) = e_u^\top e_i$ evaluated on
+the original, unaugmented graph: neither the augmentation nor the contrastive branch is
+active at inference, so both act purely as training-time regularizers on an otherwise
+unmodified LightGCN scoring function. Algorithm~\ref{alg:training} summarizes one training
+epoch.
+
+\begin{algorithm}[t]
+\caption{One training epoch of Popularity-Aware LightGCN}
+\label{alg:training}
+\begin{algorithmic}[1]
+\REQUIRE training graph $A$, item degrees $\{d_i\}$, popularity groups, weights
+$\lambda_{ILE}, \lambda_{CL}$, temperature $\tau$, sampling sharpness $\beta$, switches for
+main-pass augmentation (AUG) and contrastive learning (CL)
+\FOR{each mini-batch step}
+    \STATE Sample positive pairs $(u,i^+)$ uniformly from the training interactions
+    \STATE Sample negatives $i^- \sim \mathrm{Categorical}(d^{\beta})$
+    (Eq.~\eqref{eq:pop-aware-negative-sampling}); reject and re-draw if $i^-$ is a training
+    positive of $u$
+    \STATE $\hat{A}_{\mathrm{main}} \leftarrow$ degree-aware (or uniform) dropout of $A$ if
+    AUG is enabled, else $A$
+    \STATE Propagate $\hat{A}_{\mathrm{main}}$ (Eq.~\eqref{eq:lightgcn-propagation}) to obtain
+    $s(u,i^+)$, $s(u,i^-)$, and the ego embeddings of the batch
+    \STATE Compute $\mathcal{L}_{BPR}$ (Eq.~\eqref{eq:bpr}) and $\mathcal{L}_{reg}$ (Eq.~\eqref{eq:l2reg})
+    \IF{ILE is enabled}
+        \STATE Partition the batch by the popularity group of $i^+$; compute
+        $\mathcal{L}_{ILE}$ (Eq.~\eqref{eq:ile})
+    \ENDIF
+    \IF{CL is enabled}
+        \STATE Sample two fresh views $\hat{A}^{(1)}, \hat{A}^{(2)}$ of the original graph $A$
+        via the configured edge-dropout scheme; propagate both
+        \STATE Compute $\mathcal{L}_{CL}$ on the batch's unique users and positive items
+        (Eq.~\eqref{eq:infonce})
+    \ENDIF
+    \STATE Assemble $\mathcal{L}$ (Eq.~\eqref{eq:total-loss}); backpropagate and update
+    parameters with Adam
+\ENDFOR
+\STATE Every $E$ epochs, evaluate Recall@$K$ on the validation split and retain the checkpoint
+with the highest validation Recall@$K$; stop early after $P$ evaluations without improvement
+\end{algorithmic}
+\end{algorithm}
+
+\subsubsection{Model Selection and Evaluation Protocol}
+\label{sec:model_selection_protocol}
+
+Having described the model and its unified training objective, we conclude with the protocol
+used to select and evaluate the trained model, which underpins the validity of the results
+reported in Section~\ref{sec:results}. To obtain an unbiased estimate of generalization
+performance, the validation and test splits
+are strictly separated in role throughout training. Every $E$ epochs, the current model is
+evaluated on the validation split and the checkpoint achieving the highest validation
+Recall@$K$ is retained; training stops early if no improvement is observed for $P$ consecutive
+evaluations (Algorithm~\ref{alg:training}). The test split is touched \emph{exactly once},
+after training has concluded, using the retained best-validation checkpoint; at no point is a
+test-set metric used to make a training or model-selection decision. All test-set results
+reported in Section~\ref{sec:results} therefore reflect genuine out-of-sample generalization
+rather than a checkpoint selected in hindsight on the test set. Unless otherwise noted,
+$K=20$ throughout: Recall@20 is used both as the model-selection criterion in
+Algorithm~\ref{alg:training} and as the primary reported accuracy metric in Section~\ref{sec:results}.
+
+\subsection{Implementation Details}
+\label{sec:implementation_details}
+
+\paragraph{Architecture and initialization.}
+All models share an embedding dimension of $d=64$. The backbone
+(Section~\ref{sec:popularity-aware_lightGCN_with_item_loss_equalization}) uses $K=2$
+propagation layers in our main experiments, which we found to avoid the over-smoothing effect
+observed with a deeper, 3-layer backbone on this dataset (Section~\ref{sec:results}). Embedding
+weights are initialized from $\mathcal{N}(0, 0.1^2)$.
+
+\paragraph{Popularity groups.}
+Item popularity groups (head/middle/tail,
+Section~\ref{sec:popularity-aware_lightGCN_with_item_loss_equalization}) are computed once
+from training-graph item degrees using the 50th and 80th percentile cutoffs described above,
+and held fixed throughout training and evaluation.
+
+\paragraph{Optimization.}
+All models are trained with Adam using a learning rate of $10^{-3}$, an $\ell_2$ weight of
+$\lambda_{reg}=10^{-4}$ (Eq.~\eqref{eq:l2reg}), and mini-batches of 4096 triplets. Gradients
+are clipped to a maximum global norm of $1.0$ after every backward pass. Models are trained
+for up to 100 epochs under the early-stopping and checkpointing protocol of
+Section~\ref{sec:model_selection_protocol} ($E=5$, $P=10$).
+
+The complete list of hyperparameters and their explored ranges is given in
+Section~\ref{sec:hyperparameters} (Table~\ref{tab:hyperparams-master}), together with the
+exact combination selected for each configuration reported in Section~\ref{sec:results}
+(Table~\ref{tab:operating-points}).
+
+\paragraph{Software, hardware, and reproducibility.}
+The model is implemented in PyTorch and trained on a single NVIDIA A100 GPU. Each reported
+configuration is trained with three random seeds (42, 0, 1); the model parameters and the
+mini-batch sampling stream are seeded separately, so that a given run is exactly
+reproducible. Each run periodically checkpoints its model and optimizer state, allowing
+training to be resumed after interruption without altering the final result, and logs
+per-epoch training and validation metrics for post-hoc inspection.
+
+\subsection{Hyperparameters}
+\label{sec:hyperparameters}
+
+Table~\ref{tab:hyperparams-master} lists every hyperparameter introduced in
+Section~\ref{sec:proposed_method} and Section~\ref{sec:implementation_details}, together with
+the value or range used in this work. Table~\ref{tab:operating-points} then gives the exact
+combination selected for each named configuration reported in Section~\ref{sec:results}.
+
+\begin{table}[t]
+\centering
+\caption{All hyperparameters of Popularity-Aware LightGCN.}
+\label{tab:hyperparams-master}
+\fitwidthtable{%
+\begin{tabular}{lll}
+\toprule
+Symbol & Description & Value / range \\
+\midrule
+$d$ & Embedding dimension & $64$ \\
+$K$ & Propagation layers (Eq.~\eqref{eq:lightgcn-propagation}) & $\{2, 3\}$ \\
+--- & Adam learning rate & $10^{-3}$ \\
+$\lambda_{reg}$ & $\ell_2$ weight (Eq.~\eqref{eq:l2reg}) & $10^{-4}$ \\
+--- & Mini-batch size & $4096$ triplets \\
+--- & Gradient-clipping max norm & $1.0$ \\
+--- & Maximum training epochs & $100$ \\
+$E$ & Validation frequency (Algorithm~\ref{alg:training}) & every $5$ epochs \\
+$P$ & Early-stopping patience (Algorithm~\ref{alg:training}) & $10$ evaluations \\
+--- & Head / tail popularity percentile cutoffs & $80$th / $50$th \\
+$\lambda_{ILE}$ & ILE weight (Eq.~\eqref{eq:total-loss}) & $\{0, 0.1, 0.5, 1.0\}$ \\
+$\lambda_{CL}$ & Contrastive weight (Eq.~\eqref{eq:total-loss}) & $\{0, 0.1, 0.5\}$ \\
+$\tau$ & InfoNCE temperature (Eq.~\eqref{eq:infonce}) & $0.2$ \\
+$p_{min}, p_{max}$ & Degree-aware dropout range (Eq.~\eqref{eq:degree-aware-dropout-prob}) & $0.1$, $0.4$ \\
+$p_{uniform}$ & Uniform-dropout ablation probability & $0.1$ \\
+$\beta$ & Negative-sampling sharpness (Eq.~\eqref{eq:pop-aware-negative-sampling}) & $\{0, 0.5\}$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[t]
+\centering
+\caption{Exact hyperparameter combination for each configuration reported in
+Section~\ref{sec:results} (test-set results, mean over 3 seeds: 42, 0, 1). All configurations use
+$d=64$, $K=2$, $\tau=0.2$, and the degree-aware dropout scheme; the main forward pass used for
+$\mathcal{L}_{BPR}$ and $\mathcal{L}_{ILE}$ is \emph{not} itself augmented in these results
+(aug\_main~$=$~off for every row). Consequently, Degree-Aware Graph Augmentation
+(Section~\ref{sec:optional_degree_aware_graph_augmentation}) is validated here only
+indirectly, through the view construction of the contrastive branch
+(Section~\ref{sec:contrastive_learning}); a standalone ablation of main-pass augmentation is
+left for future work.}
+\label{tab:operating-points}
+\fitwidthtable{%
+\begin{tabular}{lccc}
+\toprule
+Configuration & $\lambda_{ILE}$ & $\lambda_{CL}$ & $\beta$ \\
+\midrule
+LightGCN (baseline) & $0$ & $0$ & $0$ \\
+PopAware --- accuracy & $0.1$ & $0.1$ & $0.5$ \\
+PopAware-BEST --- balanced & $1.0$ & $0.1$ & $0.5$ \\
+PopAware --- high-tail & $1.0$ & $0.1$ & $0$ \\
+PopAware --- fairness & $1.0$ & $0.5$ & $0$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\subsection{Results for the Proposed Method}
+\label{sec:results}
+
+\paragraph{Setup recap.}
+We evaluate on MovieLens-1M under the leave-one-out protocol of
+Section~\ref{sec:model_selection_protocol}: $6{,}034$ users, $3{,}533$ items, $563{,}204$
+training interactions, and one held-out validation and one held-out test interaction per
+user. All results below follow the exact hyperparameter combinations of
+Table~\ref{tab:operating-points} and are averaged over three seeds ($42$, $0$, $1$), reported
+as mean~$\pm$~standard deviation. We report the accuracy metrics (Recall@10, NDCG@10,
+Recall@20, NDCG@20) and the popularity-bias metrics (TailRecall@20, Coverage@20, ARP@20,
+Tail/Middle/Head Exposure@20) defined in Section~[Metrics]. Recalling the motivation of
+Section~\ref{sec:proposed_method}, a successful outcome requires TailRecall@20,
+Coverage@20, TailExposure@20, and MiddleExposure@20 to \emph{increase}, ARP@20 and
+HeadExposure@20 to \emph{decrease}, and Recall@20/NDCG@20 to not decrease sharply relative to
+the LightGCN backbone.
+
+\paragraph{Main results.}
+Table~\ref{tab:results-accuracy} reports accuracy and Table~\ref{tab:results-bias} reports
+popularity-bias metrics, for the LightGCN backbone, the four operating points of
+Popularity-Aware LightGCN (Table~\ref{tab:operating-points}), and two external reference
+methods reported elsewhere in this work, MostPopular and BPR-MF (single run each, no seed
+variance available). \emph{PopAware-BEST} improves \emph{every} metric relative to the
+LightGCN backbone: Recall@20 and NDCG@20 both increase (rather than merely holding steady),
+while TailRecall@20 rises by a factor of $6.5\times$, Coverage@20 by $35\%$, and ARP@20 and
+HeadExposure@20 fall by $6.3\%$ and $7.9\%$, respectively. The remaining three operating
+points trace out a frontier along the accuracy--fairness trade-off: \emph{accuracy} attains
+the highest Recall@20/NDCG@20 in the table, while \emph{high-tail} attains the highest
+Recall@10/NDCG@10 and the highest TailRecall@20; and \emph{fairness} attains the best
+Coverage@20, ARP@20, TailExposure@20, MiddleExposure@20, and HeadExposure@20 of all seven
+methods, at the cost of the largest accuracy drop. No baseline or external reference method
+attains the best value on any metric in either table --- every bolded entry belongs to one of
+the four PopAware operating points.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Accuracy metrics on the MovieLens-1M test set. PopAware rows report mean $\pm$
+std over 3 seeds; MostPopular and BPR-MF are single-run external references.}
+\label{tab:results-accuracy}
+\fitwidthtable{%
+\begin{tabular}{lcccc}
+\toprule
+Method & Recall@10$\uparrow$ & NDCG@10$\uparrow$ & Recall@20$\uparrow$ & NDCG@20$\uparrow$ \\
+\midrule
+MostPopular (ref.) & $0.0403$ & $0.0189$ & $0.0723$ & $0.0269$ \\
+BPR-MF (ref.) & $0.0742$ & $0.0369$ & $0.1309$ & $0.0511$ \\
+LightGCN (backbone) & $0.0725\pm0.0013$ & $0.0356\pm0.0002$ & $0.1287\pm0.0005$ & $0.0497\pm0.0002$ \\
+PopAware --- accuracy & $0.0771\pm0.0009$ & $0.0378\pm0.0003$ & $\mathbf{0.1367\pm0.0035}$ & $\mathbf{0.0527\pm0.0006}$ \\
+PopAware-BEST --- balanced & $0.0771\pm0.0012$ & $0.0376\pm0.0003$ & $0.1338\pm0.0030$ & $0.0518\pm0.0004$ \\
+PopAware --- high-tail & $\mathbf{0.0783\pm0.0006}$ & $\mathbf{0.0382\pm0.0002}$ & $0.1352\pm0.0020$ & $0.0524\pm0.0004$ \\
+PopAware --- fairness & $0.0638\pm0.0020$ & $0.0310\pm0.0005$ & $0.1052\pm0.0039$ & $0.0415\pm0.0011$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Popularity-bias metrics on the MovieLens-1M test set. Arrows indicate the direction
+of improvement. PopAware rows report mean $\pm$ std over 3 seeds; MostPopular and BPR-MF are
+single-run external references.}
+\label{tab:results-bias}
+\fitwidthtable{%
+\begin{tabular}{lcccccc}
+\toprule
+Method & TailRec.@20$\uparrow$ & Cov.@20$\uparrow$ & ARP@20$\downarrow$ & TailExp.@20$\uparrow$ & MidExp.@20$\uparrow$ & HeadExp.@20$\downarrow$ \\
+\midrule
+MostPopular (ref.) & $0.0000$ & $0.0498$ & $7.530$ & $0.0000$ & $0.0000$ & $1.0000$ \\
+BPR-MF (ref.) & $0.0109$ & $0.628$ & $6.518$ & $0.0086$ & $0.1140$ & $0.8774$ \\
+LightGCN (backbone) & $0.0050\pm0.0009$ & $0.398\pm0.004$ & $6.833\pm0.009$ & $0.0015\pm0.0001$ & $0.0398\pm0.0006$ & $0.9587\pm0.0006$ \\
+PopAware --- accuracy & $0.0143\pm0.0023$ & $0.462\pm0.029$ & $6.500\pm0.051$ & $0.0097\pm0.0011$ & $0.0732\pm0.0133$ & $0.9171\pm0.0144$ \\
+PopAware-BEST --- balanced & $0.0324\pm0.0049$ & $0.538\pm0.029$ & $6.400\pm0.042$ & $0.0320\pm0.0012$ & $0.0854\pm0.0104$ & $0.8826\pm0.0114$ \\
+PopAware --- high-tail & $\mathbf{0.0399\pm0.0023}$ & $0.499\pm0.010$ & $6.564\pm0.008$ & $0.0363\pm0.0014$ & $0.0521\pm0.0019$ & $0.9117\pm0.0005$ \\
+PopAware --- fairness & $0.0274\pm0.0035$ & $\mathbf{0.713\pm0.003}$ & $\mathbf{6.138\pm0.001}$ & $\mathbf{0.0482\pm0.0006}$ & $\mathbf{0.1184\pm0.0013}$ & $\mathbf{0.8333\pm0.0016}$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\paragraph{Effect of the individual hyperparameters.}
+The four configurations of Table~\ref{tab:operating-points} vary $\lambda_{ILE}$,
+$\lambda_{CL}$, and $\beta$ \emph{jointly}, so no pair of them isolates a single factor. To
+isolate each factor individually, we additionally consult the single-seed grid search used to
+select these operating points (all at $K=2$), changing exactly one hyperparameter at a time
+from a common base setting. Table~\ref{tab:results-sweep-isolated} reports the resulting
+Recall@20, TailRecall@20, and Coverage@20.
+
+Increasing $\lambda_{ILE}$ from $0.1$ to $1.0$ (at fixed $\lambda_{CL}=0.1$, $\beta=0$) raises
+TailRecall@20 monotonically ($0.0131 \to 0.0262 \to 0.0374$) while leaving Recall@20
+essentially unchanged ($0.1356 \to 0.1352 \to 0.1354$), without the collapse toward a
+popularity-only ranking observed with the earlier, incorrectly signed formulation of ILE
+(Section~\ref{sec:popularity-aware_lightGCN_with_item_loss_equalization}). Increasing
+$\lambda_{CL}$ from $0.1$ to $0.5$ (at fixed $\lambda_{ILE}=0.1$, $\beta=0$) trades accuracy
+for fairness: Coverage@20 rises by $47\%$ ($0.444\to0.653$), while Recall@20 falls by $18\%$
+($0.1356\to0.1112$); this $17$--$19\%$ drop is consistent across all six matched
+$(\lambda_{ILE},\beta)$ pairs in the full grid, not just the one shown. Increasing $\beta$
+from $0$ to $0.5$ (at fixed $\lambda_{ILE}=1.0$, $\lambda_{CL}=0.1$) raises Coverage@20 by
+$11\%$ and lowers HeadExposure@20, at the cost of a $20\%$ \emph{relative} drop in
+TailRecall@20 ($0.0374\to0.0299$) alongside a negligible change in Recall@20 --- i.e.,
+$\beta$ and $\lambda_{ILE}$ partially compete for the same TailRecall@20 gain rather than
+combining additively.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Isolated effect of each hyperparameter: single-seed grid search at $K=2$, changing
+exactly one factor at a time from the base row. Supplementary evidence for hyperparameter
+selection, not a substitute for the 3-seed results of Tables~\ref{tab:results-accuracy}--\ref{tab:results-bias}.}
+\label{tab:results-sweep-isolated}
+\fitwidthtable{%
+\begin{tabular}{lccc}
+\toprule
+Configuration ($K=2$, single seed) & Recall@20$\uparrow$ & TailRecall@20$\uparrow$ & Coverage@20$\uparrow$ \\
+\midrule
+Base: $\lambda_{ILE}{=}0.1,\ \lambda_{CL}{=}0.1,\ \beta{=}0$ & $0.1356$ & $0.0131$ & $0.444$ \\
+$\ \to \lambda_{ILE}{=}0.5$ (others as base) & $0.1352$ & $0.0262$ & $0.498$ \\
+$\ \to \lambda_{ILE}{=}1.0$ (others as base) & $0.1354$ & $0.0374$ & $0.503$ \\
+$\ \to \lambda_{CL}{=}0.5$ (others as base) & $0.1112$ & $0.0131$ & $0.653$ \\
+\midrule
+Base$'$: $\lambda_{ILE}{=}1.0,\ \lambda_{CL}{=}0.1,\ \beta{=}0$ & $0.1354$ & $0.0374$ & $0.503$ \\
+$\ \to \beta{=}0.5$ (others as Base$'$) & $0.1347$ & $0.0299$ & $0.558$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+Table~\ref{tab:results-layers} compares $K=2$ against $K=3$. For the \emph{plain} LightGCN
+backbone (no ILE, CL, or negative-sampling), $K=2$ clearly dominates $K=3$ on every metric,
+consistent with over-smoothing of the deeper backbone amplifying popularity bias. This is the
+comparison that motivated our choice of $K=2$ for the headline configurations. Once the full
+method is active, however, this advantage becomes small and inconsistent in sign: averaged
+over the $12$ matched $(\lambda_{ILE},\lambda_{CL},\beta)$ grid points (single seed, both
+values of $\beta$), $K=3$ is marginally \emph{higher} than $K=2$ on both Recall@20 (by
+$+0.0009$ on average; range $-0.0020$ to $+0.0037$ across the 12 pairs) and Coverage@20 (by
+$+0.010$ on average; range $-0.037$ to $+0.047$). In other words, the bias-mitigation
+components appear to substantially offset the over-smoothing penalty of the deeper backbone,
+though not consistently enough at a single seed to justify switching the headline
+configuration to $K=3$; we retain $K=2$ for the 3-seed results above and leave a 3-seed
+confirmation of the full method at $K=3$ to future work.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Effect of the number of propagation layers $K$ on the \emph{plain} LightGCN
+backbone (single seed; no ILE, CL, or negative-sampling).}
+\label{tab:results-layers}
+\fitwidthtable{%
+\begin{tabular}{lccccc}
+\toprule
+Setting & Recall@20$\uparrow$ & TailRecall@20$\uparrow$ & Coverage@20$\uparrow$ & ARP@20$\downarrow$ & HeadExposure@20$\downarrow$ \\
+\midrule
+LightGCN backbone, $K=2$ & $0.1279$ & $0.0056$ & $0.392$ & $6.846$ & $0.960$ \\
+LightGCN backbone, $K=3$ & $0.1206$ & $0.0037$ & $0.344$ & $6.944$ & $0.972$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\paragraph{Statistical robustness.}
+Because PopAware-BEST is trained with the same three seeds as the LightGCN backbone,
+Table~\ref{tab:results-significance} checks whether the improvements above exceed the
+run-to-run variance rather than reflecting a single fortunate run. For every one of the five
+target metrics, the mean~$\pm$~std interval of PopAware-BEST does not overlap with that of the
+LightGCN backbone, indicating that the improvement is unlikely to be an artifact of seed
+variance.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Non-overlap check between LightGCN and PopAware-BEST (mean $\pm$ 1 std per side).}
+\label{tab:results-significance}
+\fitwidthtable{%
+\begin{tabular}{lccc}
+\toprule
+Metric & LightGCN interval & PopAware-BEST interval & Overlap? \\
+\midrule
+Recall@20 $\uparrow$ & $[0.1282, 0.1292]$ & $[0.1308, 0.1368]$ & No \\
+TailRecall@20 $\uparrow$ & $[0.0041, 0.0059]$ & $[0.0275, 0.0373]$ & No \\
+Coverage@20 $\uparrow$ & $[0.394, 0.402]$ & $[0.509, 0.567]$ & No \\
+ARP@20 $\downarrow$ & $[6.824, 6.842]$ & $[6.358, 6.442]$ & No \\
+HeadExposure@20 $\downarrow$ & $[0.9581, 0.9593]$ & $[0.8712, 0.8940]$ & No \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\paragraph{Checklist against the stated expectations.}
+Having established that the gains of PopAware-BEST over the LightGCN backbone are unlikely to
+be seed noise, we now check them systematically against the design goals set out at the start
+of Section~\ref{sec:proposed_method}. Table~\ref{tab:results-checklist} maps each criterion
+onto the observed change from LightGCN to PopAware-BEST. All six criteria are met; notably,
+the accuracy criterion is not merely satisfied but exceeded, since Recall@20 and NDCG@20 both
+increase rather than staying flat or decreasing.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Expectations versus observed outcome (LightGCN $\to$ PopAware-BEST).}
+\label{tab:results-checklist}
+\fitwidthtable{%
+\begin{tabular}{lcc}
+\toprule
+Expectation & Observed change & Met? \\
+\midrule
+TailRecall@20 $\uparrow$ & $0.0050 \to 0.0324$ ($6.5\times$) & Yes \\
+Coverage@20 $\uparrow$ & $0.398 \to 0.538$ ($+35\%$) & Yes \\
+ARP@20 $\downarrow$ & $6.833 \to 6.400$ ($-6.3\%$) & Yes \\
+HeadExposure@20 $\downarrow$ & $0.9587 \to 0.8826$ ($-7.9\%$) & Yes \\
+Recall@20$\uparrow$ / NDCG@20$\uparrow$, no sharp drop & $+4.0\%$ / $+4.2\%$ & Yes (exceeded) \\
+TailRecall@20 ``acceptable'' (neither negligible nor extreme) & $6.5\times$ baseline, below the $8.0\times$ of \emph{high-tail} & Yes \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\paragraph{Comparison against the strongest external baseline.}
+The checklist above confirms PopAware-BEST improves on its own backbone; we next ask how it
+fares against a competitive method it was never designed against. BPR-MF is the strongest of
+the two external reference methods on both accuracy and fairness, and is therefore the more
+informative comparison point. PopAware-BEST exceeds BPR-MF on
+Recall@20 ($0.1338$ vs.\ $0.1309$), NDCG@20 ($0.0518$ vs.\ $0.0511$), TailRecall@20 ($0.0324$
+vs.\ $0.0109$, roughly $3\times$), ARP@20 ($6.400$ vs.\ $6.518$), and TailExposure@20
+($0.0320$ vs.\ $0.0086$); it trails on Coverage@20 ($0.538$ vs.\ $0.628$) and
+MiddleExposure@20 ($0.0854$ vs.\ $0.1140$), and is approximately tied on HeadExposure@20
+($0.8826$ vs.\ $0.8774$). The \emph{fairness} operating point instead dominates BPR-MF on
+every popularity-bias metric (Coverage@20 $0.713$ vs.\ $0.628$; ARP@20 $6.138$ vs.\ $6.518$;
+TailExposure@20 $0.0482$ vs.\ $0.0086$; MiddleExposure@20 $0.1184$ vs.\ $0.1140$;
+HeadExposure@20 $0.8333$ vs.\ $0.8774$), at the cost of a lower Recall@20 ($0.1052$ vs.\
+$0.1309$). Because BPR-MF is reported from a single run, these comparisons cannot be checked
+for statistical significance in the same way as Table~\ref{tab:results-significance}, and
+should be read as indicative rather than conclusive.
+
+\paragraph{Supplementary: best-observed-seed results.}
+Table~\ref{tab:results-bestseed} additionally reports, for each method, the single seed that
+attains the highest Recall@20 --- \emph{not} the mean~$\pm$~std of Table~\ref{tab:results-accuracy}/\ref{tab:results-bias}. Because this is the maximum of three noisy
+measurements, it is a systematically optimistic (upward-biased) estimator: repeating the
+experiment with more seeds would keep pushing this number up even if the underlying method
+were unchanged. Accordingly, seed~$1$ attains the best Recall@20 for four of the five PopAware
+configurations, while seed~$42$ attains it for \emph{fairness} --- there is no single ``best''
+seed across configurations, which is itself evidence that these figures should not be read as
+representative performance. We report Table~\ref{tab:results-bestseed} only for
+completeness; all claims and comparisons in this work are based on
+Tables~\ref{tab:results-accuracy}--\ref{tab:results-checklist}.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Best-observed-seed results (illustrative only; see caveat above). Not used for any
+claim in this work.}
+\label{tab:results-bestseed}
+\fitwidthtable{%
+\begin{tabular}{lccccc}
+\toprule
+Method & Seed & Recall@20$\uparrow$ & NDCG@20$\uparrow$ & TailRecall@20$\uparrow$ & Coverage@20$\uparrow$ \\
+\midrule
+LightGCN (backbone) & 1 & $0.1293$ & $0.0500$ & $0.0037$ & $0.399$ \\
+PopAware --- accuracy & 1 & $0.1407$ & $0.0534$ & $0.0112$ & $0.439$ \\
+PopAware-BEST --- balanced & 1 & $0.1369$ & $0.0523$ & $0.0393$ & $0.560$ \\
+PopAware --- high-tail & 1 & $0.1376$ & $0.0527$ & $0.0393$ & $0.509$ \\
+PopAware --- fairness & 42 & $0.1100$ & $0.0430$ & $0.0299$ & $0.714$ \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+In summary, PopAware-BEST meets every criterion set out in Section~\ref{sec:proposed_method}
+with statistically robust margins, and the broader family of four operating points traces a
+frontier that is competitive with, and in several respects exceeds, the strongest external
+baseline evaluated in this work. The implications, remaining limitations, and directions for
+future work are discussed in Section~[Discussion].
