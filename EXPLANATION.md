@@ -1,6 +1,5 @@
-# EXPLANATION.md — Popularity-Aware LightGCN: Giáo trình giải thích từ đầu
+# EXPLANATION.md — Popularity-Aware LightGCN
 
-*Tài liệu này viết cho người **chưa từng học** LightGCN hay Recommender Systems. Mọi công thức, hành vi, con số cụ thể (degree, số user/item, tên hàm...) đều lấy trực tiếp từ sơ đồ/code thật của dự án. Những đoạn giải thích **trực giác/lý do chung** (vì sao kỹ thuật X thường hoạt động tốt, so sánh với kỹ thuật khác...) là kiến thức nền phổ biến trong ngành Machine Learning, được đánh dấu rõ bằng *(kiến thức nền)* — không phải phát biểu của tác giả bài báo/đồ án.*
 
 > **Nguyên tắc trình bày của tài liệu này:** các khối được sắp xếp theo đúng **thứ tự phụ thuộc logic** — một khối chỉ được giải thích SAU KHI mọi khái niệm nó cần đã được giới thiệu trước đó. Vì vậy **thứ tự trong tài liệu này khác với số ①-⑦ trên sơ đồ gốc** (sơ đồ vẽ theo bố cục không gian, không phải theo thứ tự nên đọc để dễ hiểu nhất). Mỗi khối đều có ghi chú "tương ứng khối nào trên sơ đồ".
 
