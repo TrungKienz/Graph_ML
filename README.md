@@ -249,6 +249,59 @@ checking sync status first.
    ```bash
    ./run_on_gpu.sh evaluate_test_full.py
    ```
+   This prints a comparison table to the console and writes
+   `results/full_test_metrics_<timestamp>.csv` and
+   `results/full_comparison_<timestamp>.csv` — this is the main "show me the
+   numbers" step after training.
+6. **Build the final results table** (Markdown + LaTeX, matching the
+   [Results](#results) tables below) from `results/metrics/main_results.csv`
+   and the newest `results/popaware_final_meanstd_*.csv`:
+   ```bash
+   python -c "from src.make_table import main; main()"
+   ```
+   Writes `results/main_results_table.md` and `results/main_results_table.tex`.
+7. **Generate report figures** (item degree distribution, popularity group
+   sizes, Recall-vs-TailRecall trade-off, Coverage by model, Head/Middle/Tail
+   exposure by model, training loss curves) via `src/plots.py`. This module is
+   a library of plotting functions (no CLI), so call the ones you need
+   directly:
+   ```bash
+   python - <<'PY'
+   from src.data_loader import DataProcessor
+   from src.collect_results import main as collect_results
+   from src.plots import (
+       plot_item_degree_distribution, plot_popularity_group_distribution,
+       plot_recall_vs_tail_recall, plot_coverage_by_model, plot_exposure_by_group,
+       plot_training_loss_from_history,
+   )
+
+   data = DataProcessor()
+   plot_item_degree_distribution(data.item_degree)          # fig1 - needs only preprocessed data
+   plot_popularity_group_distribution(data.item_popularity_group)  # fig2 - same
+
+   collect_results()  # consolidates results/popaware_final_meanstd_*.csv into results/results.csv
+   plot_recall_vs_tail_recall()   # fig3 - needs results/results.csv (previous line)
+   plot_coverage_by_model()       # fig4 - same
+   plot_exposure_by_group()       # fig5 - same
+
+   plot_training_loss_from_history({  # fig6 - point at any per-epoch history CSV(s) you want to compare
+       "PopAware-BEST": "results/popaware/history_<run_id>.csv",
+   })
+   PY
+   ```
+   Figures 1-2 only need the preprocessed tensors (`preprocess_data/`) and can
+   be produced before any model is trained; figures 3-5 need
+   `results/results.csv` populated first (via `collect_results()` above, which
+   pulls from the 3-seed mean/std CSV and the notebook baselines); figure 6
+   needs the per-epoch `results/popaware/history_<run_id>.csv` written by
+   whichever training run(s) you want to plot. All PNGs are saved under
+   `figures/`.
+
+**Note — no title-level recommendation demo:** the pipeline above only ever
+produces aggregate metrics and figures, never a human-readable "here is what
+we recommend to user X, by movie title" list. There is currently no script
+that maps a user's top-K item indices back to `data/MovieLens1M/raw/movies.dat`
+titles for a qualitative demo; everything is evaluated purely numerically.
 
 Every training run (`train_popaware_lightgcn` in `src/popaware_training.py`)
 automatically:
@@ -325,15 +378,29 @@ table.
 
 ## Documentation
 
-- [`PopAware_LightGCN_Documentation.md`](PopAware_LightGCN_Documentation.md) —
-  full Vietnamese technical report: problem/motivation, data, metrics,
-  method formulas, training setup, experimental design, results tables
-  (mean±std, significance, best-seed), architecture/frontier diagrams,
-  analysis vs. expectations, limitations, conclusion, and a slide-ready
-  summary table.
-- [`report_method_section.tex`](report_method_section.tex) — English LaTeX
-  write-up of the proposed method, implementation details, hyperparameters,
-  and results section, for inclusion in the course report.
+This project has several documents, each written for a different reader and a
+different depth of understanding. Pick the one that matches what you're
+trying to do — reading them in the order below (top to bottom) takes you from
+zero knowledge to full technical mastery of the method:
+
+| # | Document | For whom / when to read it |
+|---|---|---|
+| 1 | [`EXPLANATION.md`](EXPLANATION.md) | **Never studied recommender systems / GNNs before.** A from-scratch teaching document: every one of the model's 13 building blocks explained with intuition, real-world analogies, full LaTeX formulas with every symbol broken down, and **one single worked numeric example threaded through all 13 blocks** (same 4 users/3 items, real hand-computed numbers flowing from block to block) — plus a dedicated Popularity Bias explainer and a comparison table vs. plain LightGCN. Start here if a formula or the overall pipeline doesn't make sense yet. |
+| 2 | [`Method_Architecture_Documentation.md`](Method_Architecture_Documentation.md) | **Reading or modifying the code.** Architecture overview (the two-branch design — main path vs. auxiliary contrastive path), folder structure, step-by-step data flow, full loss table, hyperparameter table, the 5 reported configurations, an honest limitations list, and a quick "question → which file" lookup table. |
+| 3 | [`PopAware_LightGCN_Documentation.md`](PopAware_LightGCN_Documentation.md) | **Want the full technical report.** Problem/motivation, data, metrics, method formulas, training setup, experimental design, results tables (mean±std, significance, best-seed), architecture/frontier diagrams, analysis vs. expectations, limitations, conclusion — in Vietnamese. |
+| 4 | [`report_method_section.tex`](report_method_section.tex) | **Need the English write-up** of the proposed method, implementation details, hyperparameters, and results section, for inclusion in the course report. |
+| 5 | [`Slide_Review_and_Defense_QA.md`](Slide_Review_and_Defense_QA.md) | **Preparing to present or defend this project.** 44 anticipated Q&A questions with answers grounded in the actual code/logs, presentation scripts, and a step-by-step pipeline walkthrough tagged with exact file/function references. |
+
+**Reading order recommendation:** if you're new to the project, read `EXPLANATION.md` in full first — it assumes no prior background and builds up every concept before using it. Once the model itself makes sense, use `Method_Architecture_Documentation.md` as your map while reading `src/`. The other three documents are reference material for writing/presenting, not for learning the method.
+
+Everything above reflects the **current, actually-used** method and pipeline
+(`train_all_popaware.py` / `train_sweep_popaware.py` / `train_final_seeds.py`
+→ `src/popaware_training.py`). An earlier causal-debiasing direction
+(`pd_debias.py`, `pd_training.py`) and an earlier ILE-only training loop
+(`src/ile_training.py`, `src/run_ile_experiments.py`) were explored and
+superseded before this method was finalized — see the "Repository Structure"
+note above; they are not documented further because they are not part of the
+reported results.
 
 ## Team Workflow
 
