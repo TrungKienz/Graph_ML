@@ -220,6 +220,13 @@ def main() -> bool:
     model_path = pick_model_path(Path(args.models_dir), args.model_name)
     model, info = load_model(model_path, data, device)
     print(f"\n📦 Using checkpoint: {model_path.name} (model_name={info['model_name']})")
+    if info["model_name"] == "PopAware-BEST":
+        print("   ⚠️  Naming caveat (confirmed against results/popaware_sweep_*.csv): this file is "
+              "the automatic winner of the hyperparameter SWEEP (layers=3, λ_ILE=0.1, λ_CL=0.5, "
+              "β=0.5, single seed). It shares its display name with, but is NOT the same model as, "
+              "the hand-picked layers=2/λ_ILE=1.0/λ_CL=0.1/β=0.5 config whose 3-seed mean±std is "
+              "reported as 'PopAware-BEST' in README.md/results tables. See README.md 'How to Run' "
+              "step 6 for details.")
 
     test_items = data.get_test_items_tensor()
     if args.user is not None:

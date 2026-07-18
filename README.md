@@ -271,6 +271,22 @@ checking sync status first.
    `(user, item)` pair against the cached `train/val/test_edges.pt` before
    printing anything** — it refuses to run if the reconstruction doesn't
    match exactly, rather than risk showing a wrong title.
+
+   **⚠️ Naming caveat, confirmed by re-deriving the sweep's frontier rule
+   directly from `results/popaware_sweep_20260715_155058.csv`:** the only
+   checkpoint currently on disk, `models/final_model_PopAware-BEST_*.pt`, is
+   the **automatic winner of the step-3 hyperparameter sweep**
+   (`num_layers=3, λ_ILE=0.1, λ_CL=0.5, β=0.5`, single seed, Recall@20=0.1148,
+   Coverage@20=0.6148) — it happens to share the display name
+   "PopAware-BEST" with, but is a **different model from**, the hand-picked
+   `num_layers=2, λ_ILE=1.0, λ_CL=0.1, β=0.5` configuration whose 3-seed
+   mean±std (Recall@20=0.1338±0.0030) is what actually appears in the
+   [Results](#results) table below. `train_final_seeds.py` only ever saves
+   metrics, never model weights, so the exact weights behind the headline
+   table don't currently exist on disk. This demo and `evaluate_test_full.py`
+   are therefore showing/scoring the sweep-stage model, not the one in the
+   results table — to get the latter, rerun that specific configuration and
+   save its weights.
 7. **Build the final results table** (Markdown + LaTeX, matching the
    [Results](#results) tables below) from `results/metrics/main_results.csv`
    and the newest `results/popaware_final_meanstd_*.csv`:
@@ -328,6 +344,12 @@ automatically:
 - appends per-epoch metrics to `results/popaware/history_<run_id>.csv`.
 
 ## Results
+
+*Note: these numbers are the metrics recorded by `train_final_seeds.py`
+(mean±std over 3 seeds). No saved checkpoint currently corresponds to the
+exact `PopAware-BEST` row below — see the naming caveat under step 6 of
+[How to Run](#how-to-run) before using `models/final_model_PopAware-BEST_*.pt`
+as if it were this row.*
 
 Reference baselines (`results/metrics/main_results.csv`, K=20):
 

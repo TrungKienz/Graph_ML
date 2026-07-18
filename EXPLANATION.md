@@ -620,6 +620,29 @@ $$P(neg=i) \propto \deg_i^{\ \beta}$$
 
 `β=0`: `deg^0=1` mọi item → lấy mẫu đều. `β>0`: item degree càng cao, trọng số càng lớn theo hàm mũ.
 
+### Cơ chế "bốc" thật sự: từ 1 phân phối xác suất ra MỘT item cụ thể
+
+Có `P(i1)=45.3%, P(i2)=32.0%, P(i3)=22.7%` mới chỉ là biết TỶ LỆ — chưa nói máy tính thực sự chọn ra MỘT item cụ thể như thế nào. Cơ chế thật (`src/neg_sampling.py`, hàm dùng `torch.multinomial`) hoạt động giống hệt **một vòng quay số trúng thưởng (roulette wheel)** *(kiến thức nền: đây là cách hình dung trực quan chuẩn cho lấy mẫu categorical/multinomial)*:
+
+**Bước 1 — chia đường thẳng `[0,1)` thành các đoạn tỷ lệ đúng với xác suất từng item**, xếp liên tiếp nhau:
+```
+0                0.453              0.773                1.0
+├────────────────┼───────────────────┼───────────────────┤
+│      i1         │        i2         │        i3         │
+│   (45.3%)       │      (32.0%)      │      (22.7%)      │
+└─────────────────┴───────────────────┴───────────────────┘
+```
+Đoạn của `i1` dài nhất (từ 0 đến 0.453, chiếm 45.3% độ dài cả đường thẳng) vì `P(i1)` lớn nhất; đoạn của `i3` ngắn nhất.
+
+**Bước 2 — bốc một số thực ngẫu nhiên `r` trong `[0,1)` (đều)**, giống ném 1 phi tiêu ngẫu nhiên vào đường thẳng trên. Item được chọn là item mà đoạn của nó **chứa** điểm rơi `r`:
+- Nếu `r ∈ [0, 0.453)` → chọn `i1`
+- Nếu `r ∈ [0.453, 0.773)` → chọn `i2`
+- Nếu `r ∈ [0.773, 1.0)` → chọn `i3`
+
+**Vì sao cơ chế này cho ra đúng tỷ lệ đã tính?** Vì `r` bốc đều trên `[0,1)`, xác suất phi tiêu rơi vào 1 đoạn bất kỳ **chính bằng độ dài đoạn đó** — mà độ dài mỗi đoạn đã được đặt đúng bằng `P(i)` ở Bước 1. Ném phi tiêu này lặp lại hàng nghìn lần (hàng nghìn interaction trong 1 batch), tỷ lệ trúng từng item sẽ hội tụ về đúng `45.3%/32.0%/22.7%` — đúng như một vòng quay số trúng thưởng có ô "45.3%" to hơn hẳn ô "22.7%" thì kim quay trúng ô to sẽ thường xuyên hơn, dù không phải lần nào cũng vậy.
+
+**Lưu ý:** cơ chế "vòng quay số" này diễn ra TRƯỚC bước rejection sampling (loại trừ item đã tương tác) đã nói ở mục 4 — nghĩa là: bốc trúng item nào theo đúng vòng quay này trước, rồi MỚI kiểm tra item đó có phải positive của user hay không để quyết định giữ hay bốc lại.
+
 ### 6. Ví dụ tính toán từng bước
 
 3 item: `deg(i1)=4, deg(i2)=2, deg(i3)=1`, `β=0.5`:
@@ -796,7 +819,19 @@ $$p_{drop}(i) = p_{min} + (p_{max} - p_{min}) \cdot \frac{\log(1 + \deg_i)}{\log
 
 `log(1+x)`: nén khoảng giá trị degree (item cực phổ biến không phóng đại quá mức chênh lệch). *(kiến thức nền: lý do dùng log)*
 
-**Dropout đối xứng:** quyết định giữ/xoá chỉ thực hiện 1 lần trên mỗi cạnh vô hướng (xét theo item), rồi mirror sang cả 2 chiều — giữ đồ thị vô hướng hợp lệ (cần cho công thức `D^(-1/2)AD^(-1/2)` ở Khối 2 có ý nghĩa đúng khi áp dụng lại).
+### Cơ chế "bốc" thật sự: từ 1 con số xác suất `p_drop(i)` ra quyết định GIỮ/XOÁ 1 cạnh cụ thể
+
+Có `p_drop(i)` mới chỉ là biết "khả năng bị xoá là bao nhiêu %" — chưa nói máy tính THỰC SỰ quyết định giữ hay xoá từng cạnh cụ thể như thế nào. Đây là đoạn code thật (`src/popaware_training.py: symmetric_edge_dropout`), giải thích từng bước:
+
+**Bước 1 — chỉ xét cạnh theo 1 chiều duy nhất:** đồ thị lưu cả 2 chiều `user→item` và `item→user` cho mỗi tương tác (vô hướng). Hàm này **chỉ lọc ra chiều `user→item`** trước — nghĩa là mỗi tương tác chỉ được "xét" đúng 1 lần (chưa nhân đôi), tránh tình huống 2 chiều của cùng 1 cạnh bị xử lý độc lập rồi ra kết quả lệch nhau.
+
+**Bước 2 — tung "đồng xu lệch" cho từng cạnh (Bernoulli trial):** với MỖI cạnh `(u,i)` đang xét, máy tính bốc **một số thực ngẫu nhiên `r` trong khoảng `[0,1)`** (đều — mọi giá trị trong khoảng này có khả năng ra như nhau). Quyết định:
+$$\text{GIỮ cạnh} \iff r \ge p_{drop}(i), \qquad \text{XOÁ cạnh} \iff r < p_{drop}(i)$$
+**Vì sao phép so sánh này đúng cho ra đúng tỷ lệ xoá `p_drop(i)`?** Vì `r` được bốc ĐỀU trong `[0,1)`, xác suất để `r < p_drop(i)` (xoá) chính xác bằng độ dài đoạn `[0, p_drop(i))`, tức bằng đúng `p_drop(i)` — giống việc tung một đồng xu bị "lệch" (không phải 50/50) với xác suất ra mặt "xoá" đúng bằng `p_drop(i)`. Ví dụ `i1` có `p_drop=0.4`: cứ 10 cạnh nối tới `i1`, trung bình khoảng 4 cạnh sẽ bị xoá — nhưng đây là XÁC SUẤT, không phải quy tắc chắc chắn (có thể lần này ra 3/10, lần khác ra 5/10).
+
+**Bước 3 — mirror lại cả 2 chiều:** với các cạnh vừa được GIỮ, tạo thêm bản sao chiều ngược (`item→user`), rồi ghép cả 2 chiều lại thành `edge_index` cuối cùng của view đó. Đây chính là ý nghĩa "dropout đối xứng": quyết định chỉ ra 1 lần (Bước 2, trên chiều `user→item`), rồi COPY y hệt sang chiều kia — không bao giờ có chuyện 1 cạnh chỉ tồn tại 1 chiều, giữ đồ thị luôn hợp lệ (cần thiết để công thức `D^{-1/2}AD^{-1/2}` ở Khối 2 tính đúng).
+
+**Vì sao gọi hàm này 2 lần lại ra 2 view KHÁC NHAU, dù dùng đúng cùng bảng `p_drop`?** Vì Bước 2 bốc số ngẫu nhiên MỚI (`torch.rand()`) mỗi lần hàm được gọi — giống tung lại đồng xu lệch đó thêm 1 lần nữa: xác suất ra mặt "xoá" ở mỗi cạnh vẫn giữ nguyên `p_drop(i)`, nhưng KẾT QUẢ CỤ THỂ của từng lần tung có thể khác nhau. Đó là lý do ở ví dụ mục 4: cùng bảng `p_drop` (`i1`=0.4 cao nhất), nhưng lần gọi thứ nhất (View 1) "xui xẻo" xoá đúng cạnh `(u2,i1)`, còn lần gọi thứ hai (View 2) lại xoá đúng cạnh `(u3,i1)` — 2 kết quả khác nhau hoàn toàn hợp lý, vì đó là 2 lượt tung xúc xắc độc lập, không phải 2 lần đọc cùng 1 kết quả đã định sẵn.
 
 ### 6. Ví dụ tính toán từng bước
 
@@ -1296,6 +1331,92 @@ Mỗi lần huấn luyện gồm nhiều **epoch** (tối đa 100). Mỗi epoch,
 Với mỗi batch: (1) **Lấy mẫu** (Khối 6) — chọn positive + negative; (2) **Forward** (Khối 2, 3, 4, 8, 9) — lan truyền qua Backbone (3 lần nếu bật CL), tính điểm số; (3) **Loss** (Khối 5, 7, 10, 11, 12) — tính cả 4 thành phần, cộng lại; (4) **Backward** — `loss.backward()`, PyTorch tự tính đạo hàm; (5) **Update** — `optimizer.step()` (Adam), sau khi giới hạn độ lớn gradient tối đa 1.0 (gradient clipping) để tránh cập nhật quá đột ngột.
 
 Cứ mỗi 5 epoch, mô hình tạm dừng, chạy thử trên **Validation** để đo Recall@K — cải thiện thì lưu "best checkpoint"; không cải thiện 10 lần liên tiếp (50 epoch) thì dừng sớm.
+
+**Lưu ý phân biệt 2 tầng "chọn" khác nhau, dễ nhầm:** việc chọn best-checkpoint bằng Validation ở trên là chọn **BÊN TRONG một lần train** (chọn epoch nào tốt nhất trong quá trình 1 model học). Phần tiếp theo dưới đây nói về việc chọn **GIỮA nhiều lần train khác nhau** (train đi train lại với cấu hình/tham số khác nhau) — đây là 1 tầng hoàn toàn khác, ở mức "chiến lược thực nghiệm" chứ không phải ở mức "một lần train".
+
+---
+
+# CHIẾN LƯỢC THỰC NGHIỆM — TẠI SAO TRAIN NHIỀU LẦN, VỚI NHIỀU BỘ THAM SỐ?
+
+Đọc log/kết quả của dự án, bạn sẽ thấy KHÔNG PHẢI chỉ có 1 lần train — mà là hàng chục lần, với các bộ tham số (`λ_ILE, λ_CL, β, num_layers`...) khác nhau, chia thành **3 giai đoạn có mục đích hoàn toàn khác nhau**. Đây là chiến lược thực nghiệm chuẩn trong nghiên cứu Machine Learning *(kiến thức nền)*, không phải chạy thử ngẫu nhiên cho tới khi ra số đẹp.
+
+## Giai đoạn 1 — Ablation Study (`train_all_popaware.py`): CHỨNG MINH từng thành phần có ích thật
+
+**Câu hỏi cần trả lời:** phương pháp đề xuất có 4 thành phần bổ sung (ILE, Degree-Aware Augmentation, Contrastive Learning, Popularity-Aware Negative Sampling). Làm sao biết CHẮC CHẮN từng thành phần thực sự có đóng góp, chứ không phải "gộp 4 thứ lại tình cờ ra kết quả tốt, nhưng có khi 2 trong 4 thứ chẳng làm gì cả"?
+
+**Cách làm — bật/tắt từng thành phần một cách có hệ thống**, giữ nguyên mọi thứ khác (data, seed, số lớp...), chỉ đổi đúng phần đang khảo sát:
+
+| Config | ILE | Degree-Aware Aug | Contrastive Learning | Mục đích so sánh |
+|---|---|---|---|---|
+| `baseline` | ✗ | ✗ | ✗ | LightGCN gốc, điểm quy chiếu để tính delta |
+| `ile` | ✓ | ✗ | ✗ | Riêng ILE đóng góp bao nhiêu? |
+| `degreeaug` | ✗ | ✓ | ✗ | Riêng Augmentation (không CL) đóng góp bao nhiêu? |
+| `degreeaug_cl` | ✗ | ✗ | ✓ | Riêng Augmentation+Contrastive đóng góp bao nhiêu? |
+| `full` | ✓ | ✗ | ✓ | Cả 3 thành phần cộng lại (Negative Sampling luôn bật/tắt độc lập qua `--neg-pop-beta`, không nằm trong bảng bật/tắt này) |
+
+**Đây chính là ý nghĩa của từ "ablation"** *(kiến thức nền: thuật ngữ chuẩn trong ML)*: "cắt bỏ" từng bộ phận một để đo xem thiếu nó thì mô hình tệ đi bao nhiêu — suy luận ngược: nếu thiếu nó mà tệ đi rõ rệt, nghĩa là nó thực sự có ích. Output: `results/popaware_results_<timestamp>.csv`, mỗi dòng 1 config với đủ 10 metric, và script tự in ra bảng "delta vs baseline" (chênh lệch so với baseline, kèm ✅/⚠️ theo đúng kỳ vọng: TailRecall/Coverage phải tăng, ARP/HeadExposure phải giảm, Recall/NDCG không được tụt quá nhiều).
+
+## Giai đoạn 2 — Hyperparameter Sweep (`train_sweep_popaware.py`): TÌM bộ tham số tốt, KHÔNG chọn tay
+
+**Vấn đề:** Giai đoạn 1 đã chứng minh 3 thành phần (ILE, Augmentation, CL) đều có ích — nhưng có ích *ở mức λ nào*? `λ_ILE`/`λ_CL` là "núm vặn cường độ" (Khối 12) — vặn quá nhẹ thì tác dụng không đáng kể, vặn quá mạnh thì phá vỡ accuracy. Không có công thức toán học nào tính sẵn "λ_ILE tối ưu = X" — phải **dò tìm bằng thực nghiệm**.
+
+**Cách làm — quét lưới (grid search)** *(kiến thức nền: kỹ thuật chuẩn để dò hyperparameter)*: thử **mọi tổ hợp** giá trị của các tham số, giống dò từng ô trong 1 bảng nhiều chiều. Với cấu hình `full` (bật cả ILE+CL), lưới thật của dự án là:
+
+```
+num_layers ∈ {2, 3}        (2 giá trị)
+λ_ILE      ∈ {0.1, 0.5, 1.0}   (3 giá trị)
+λ_CL       ∈ {0.1, 0.5}        (2 giá trị)
+τ          = 0.2                (cố định)
+β          ∈ {0, 0.5}          (2 giá trị)
+```
+→ `2 × 3 × 2 × 1 × 2 = 24` tổ hợp — khớp đúng file thật `results/popaware_sweep_20260715_155058.csv` (24 dòng kết quả).
+
+**Vấn đề tiếp theo: trong 24 kết quả đó, làm sao BIẾT cái nào "tốt nhất" mà không cần con người tự nhìn bảng rồi chọn tay (dễ thiên vị, dễ chọn nhầm)?** Script tự động áp dụng **1 quy tắc chọn cố định, công bố trước** ("frontier rule"):
+
+$$\text{Với mỗi số lớp } L: \quad \text{ngưỡng} = \text{Recall@20}_{baseline,L} \times (1 - 0.05)$$
+
+Nghĩa là: lấy Recall@20 của baseline (cùng số lớp), cho phép giảm tối đa 5%. Trong số các tổ hợp còn đạt ngưỡng đó, **chọn tổ hợp có Coverage@20 cao nhất** (Coverage@20 = độ phủ catalog — thước đo giảm bias trực tiếp nhất), rồi so sánh người thắng của từng số lớp với nhau để ra người thắng chung cuộc. Script tự lưu trọng số của cấu hình thắng này thành `models/final_model_PopAware-BEST_<timestamp>.pt`.
+
+**Vì sao quy tắc này quan trọng?** Nó biến việc "chọn tham số tốt nhất" từ một quyết định chủ quan (dễ bị nghi ngờ là cherry-pick số đẹp) thành một **quy tắc khách quan, có thể lặp lại**: bất kỳ ai chạy lại đúng lưới này, áp đúng công thức này, sẽ ra đúng cấu hình đó — không phụ thuộc vào việc người chạy "thích" con số nào hơn.
+
+> **⚠️ Cảnh báo đã xác nhận bằng cách tính lại trực tiếp trên `results/popaware_sweep_20260715_155058.csv`:** cấu hình thắng THẬT của quy tắc frontier ở Giai đoạn 2 là `num_layers=3, λ_ILE=0.1, λ_CL=0.5, β=0.5` (Recall@20=0.1148, Coverage@20=0.6148, 1 seed) — **KHÁC HẲN** với cấu hình mang tên `PopAware-BEST` xuất hiện trong bảng kết quả cuối cùng ở Giai đoạn 3 ngay bên dưới (`num_layers=2, λ_ILE=1.0, λ_CL=0.1, β=0.5`). Hai cấu hình này **trùng tên nhưng không phải cùng một model** — xem chi tiết ngay dưới bảng cấu hình Giai đoạn 3.
+
+## Giai đoạn 3 — Final 3-Seed Runs (`train_final_seeds.py`): XÁC NHẬN số liệu đáng tin cậy
+
+**Vấn đề cuối cùng:** mọi kết quả ở Giai đoạn 1 và 2 đều chỉ chạy với **1 seed duy nhất** (thường là `seed=42`). Nhưng embedding khởi tạo ngẫu nhiên (`E^(0)`) và thứ tự lấy mẫu batch cũng ngẫu nhiên — nghĩa là **chạy lại với seed khác, con số sẽ hơi khác đi**. Nếu chỉ báo cáo 1 con số từ 1 seed may mắn, đó có thể là **"winner's curse"** *(kiến thức nền: hiện tượng thống kê — chọn ra giá trị lớn nhất trong nhiều lần thử ngẫu nhiên luôn có xu hướng phóng đại so với giá trị thật)*: con số đẹp không phải vì phương pháp tốt, mà vì "may mắn trúng seed tốt".
+
+**Cách làm:** chọn ra **5 cấu hình chốt** (baseline + 4 "điểm vận hành" đại diện — không phải 4 cấu hình ngẫu nhiên, mà 4 điểm được chọn có chủ đích để minh hoạ các góc khác nhau của đánh đổi accuracy/fairness), chạy MỖI cấu hình trên **3 seed khác nhau** (`42, 0, 1`), rồi báo cáo **trung bình ± độ lệch chuẩn** (`mean ± std`) thay vì 1 con số đơn lẻ:
+
+| Cấu hình | `λ_ILE` | `λ_CL` | `β` | Ý nghĩa được chọn |
+|---|---|---|---|---|
+| `LightGCN` (baseline) | 0 | 0 | 0 | Điểm quy chiếu, không có cải tiến nào |
+| `PopAware-accuracy` | 0.1 | 0.1 | 0.5 | Cường độ ILE/CL NHẸ nhất — ưu tiên giữ accuracy cao nhất trong các điểm PopAware |
+| `PopAware-BEST` | 1.0 | 0.1 | 0.5 | Cấu hình được **chọn tay** để đại diện điểm "cân bằng tốt" trên đường đánh đổi — **không phải** cấu hình thắng tự động của Giai đoạn 2 (xem cảnh báo bên trên) |
+| `PopAware-high-tail` | 1.0 | 0.1 | 0.0 | Giống hệt BEST nhưng tắt popularity-bias trong negative sampling (`β=0`) — để tách riêng xem ảnh hưởng của `β` |
+| `PopAware-fairness` | 1.0 | 0.5 | 0.0 | `λ_CL` MẠNH nhất — ưu tiên giảm bias tối đa, chấp nhận accuracy giảm rõ hơn |
+
+**Vì sao 4 điểm chứ không phải chỉ 1 "cấu hình tốt nhất"?** Vì bài toán này về bản chất là **đánh đổi** (trade-off): không có cấu hình nào vừa tốt nhất về accuracy VỪA tốt nhất về giảm bias cùng lúc — tăng cường độ debiasing luôn phải trả giá ít nhiều bằng accuracy. Báo cáo 4 điểm khác nhau trên cùng 1 đường cong đánh đổi đó trung thực hơn nhiều so với chỉ đưa ra 1 con số "tốt nhất" rồi giấu đi việc phải đánh đổi gì.
+
+Output: `results/popaware_final_runs_<timestamp>.csv` (từng lần chạy riêng lẻ, 5 cấu hình × 3 seed = 15 dòng) và `results/popaware_final_meanstd_<timestamp>.csv` (đã gộp mean±std theo từng cấu hình) — **đây chính là bảng số liệu cuối cùng xuất hiện trong README/báo cáo**, ví dụ:
+
+| Model | Recall@20 ↑ | TailRecall@20 ↑ | Coverage@20 ↑ |
+|---|---|---|---|
+| LightGCN (baseline) | 0.1287 ± 0.0005 | 0.0050 ± 0.0009 | 0.3978 ± 0.0043 |
+| PopAware-BEST | 0.1338 ± 0.0030 | 0.0324 ± 0.0049 | 0.5384 ± 0.0293 |
+
+Đọc bảng này như thế nào: `0.1338 ± 0.0030` nghĩa là qua 3 lần chạy độc lập (3 seed), Recall@20 trung bình là 0.1338, dao động khoảng ±0.0030 quanh đó — độ lệch nhỏ so với khoảng cách 0.1338 so với baseline 0.1287, nên chênh lệch này **đáng tin cậy, không phải nhiễu ngẫu nhiên**. Ngược lại, nếu độ lệch `± std` lớn gần bằng khoảng chênh lệch giữa 2 model, kết luận "model A tốt hơn model B" sẽ không còn chắc chắn.
+
+> **⚠️ Quan trọng — file trọng số đang có KHÔNG phải model của bảng trên:** `train_final_seeds.py` chỉ lưu lại **số liệu** (metrics) của 15 lần chạy (5 cấu hình × 3 seed), **không lưu lại trọng số** (`save_model()` không được gọi trong script này). File trọng số duy nhất đang có trong `models/` (`final_model_PopAware-BEST_20260715_155058.pt`) thực ra đến từ **Giai đoạn 2** (cấu hình thắng sweep tự động: `layers=3, λ_ILE=0.1, λ_CL=0.5, β=0.5`, 1 seed) — trùng tên hiển thị "PopAware-BEST" một cách **tình cờ**, nhưng là **một model khác hẳn** với cấu hình `layers=2, λ_ILE=1.0, λ_CL=0.1, β=0.5` đứng sau con số `0.1338 ± 0.0030` ở bảng trên. Nếu dùng `evaluate_test_full.py` hoặc `demo_recommend.py` để "xem lại" model PopAware-BEST, con số/gợi ý bạn thấy là của cấu hình **Giai đoạn 2**, không phải cấu hình đại diện trong bảng headline này — muốn có đúng trọng số của bảng headline, cần chạy lại đúng cấu hình đó (`layers=2, λ_ILE=1.0, λ_CL=0.1, β=0.5`) và tự lưu model.
+
+## Tóm tắt cả 3 giai đoạn — script nào, để làm gì, ra file nào
+
+| Giai đoạn | Script | Trả lời câu hỏi | Output chính | Số seed |
+|---|---|---|---|---|
+| 1. Ablation | `train_all_popaware.py` | Từng thành phần có thực sự có ích không? | `popaware_results_<ts>.csv` | 1 |
+| 2. Sweep | `train_sweep_popaware.py` | Giá trị `λ`/`β` nào tốt, chọn sao cho khách quan? | `popaware_sweep_<ts>.csv` | 1 |
+| 3. Final seeds | `train_final_seeds.py` | Số liệu đó có đáng tin cậy không (hay chỉ ăn may 1 seed)? | `popaware_final_runs_<ts>.csv` + `popaware_final_meanstd_<ts>.csv` | 3 |
+
+Ba giai đoạn nối tiếp nhau theo đúng thứ tự trên (Giai đoạn 2 chỉ có ý nghĩa SAU KHI Giai đoạn 1 đã chứng minh các thành phần đáng để tinh chỉnh; Giai đoạn 3 chỉ chạy lại đúng những cấu hình mà Giai đoạn 1-2 đã chỉ ra là đáng báo cáo, không chạy lại toàn bộ lưới 24 tổ hợp qua 3 seed — sẽ tốn gấp 3 lần compute không cần thiết cho những cấu hình đã biết là không được chọn).
 
 ---
 
