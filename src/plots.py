@@ -161,6 +161,37 @@ def plot_exposure_by_group(filename: str = "fig5_exposure.png") -> Path | None:
 # ---------------------------------------------------------------------------
 # Figure 6: training loss curve
 # ---------------------------------------------------------------------------
+def plot_training_loss_from_history(
+    history_files: dict[str, str | Path],
+    loss_column: str = "bpr",
+    filename: str = "fig6_loss_curve.png",
+) -> Path | None:
+    """Build the loss curve from per-epoch history CSVs written by the trainers.
+
+    Args:
+        history_files: mapping of ``label -> path`` to a ``results/popaware/history_*.csv``
+            file (columns include ``epoch`` and per-epoch losses ``bpr``/``ile``/``cl``).
+        loss_column: which logged loss to plot. ``"bpr"`` is the accuracy objective and
+            is comparable across models regardless of ILE/CL weights.
+    """
+    curves, labels = [], []
+    for label, path in history_files.items():
+        path = Path(path)
+        if not path.exists():
+            print(f"[plots] history missing, skipping: {path}")
+            continue
+        df = pd.read_csv(path)
+        if loss_column not in df.columns:
+            print(f"[plots] column '{loss_column}' not in {path.name}; skipping")
+            continue
+        curves.append(df[loss_column].to_numpy(dtype=float))
+        labels.append(label)
+    if not curves:
+        print("[plots] no history data; skipping figure 6")
+        return None
+    return plot_training_loss(curves, labels=labels, filename=filename)
+
+
 def plot_training_loss(loss_history, labels=None, filename: str = "fig6_loss_curve.png") -> Path:
     """Training loss vs epoch.
 
