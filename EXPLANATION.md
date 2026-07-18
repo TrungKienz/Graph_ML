@@ -75,7 +75,8 @@ PHẦN I — Nền tảng dữ liệu
   [1] Original Bipartite Graph
 
 PHẦN II — Cơ chế học biểu diễn dùng CHUNG cho cả 2 nhánh
-  [2] LightGCN Backbone  ◄── cơ chế lan truyền, dùng lại ở cả Nhánh A và Nhánh B
+  [2] LightGCN Backbone  ◄── xuất phát từ MỘT bảng embedding gốc E^(0) DUY NHẤT
+                             (không phải 2 bản sao) — dùng lại ở cả Nhánh A và Nhánh B
 
 PHẦN III — Nhánh chính: dự đoán & độ chính xác (Branch A)
   [3] Branch A (áp dụng [2] một lần, trên đồ thị SẠCH)
@@ -93,6 +94,13 @@ PHẦN V — Gộp lại & Vận hành thật
   [11] L2 Regularization (chống overfitting)
   [12] Total Loss (gộp cả 4 loss: [5]+[6]→BPR, [7]→ILE, [10]→CL, [11]→L2)
   [13] Top-K Inference (suy luận thật — CHỈ dùng nhánh [3], bỏ hết Phần IV)
+
+        ⤷ SAU [12]: đây KHÔNG PHẢI điểm dừng — .backward() làm gradient của
+          [3]-[7] (Nhánh A) VÀ [8]-[10] (Nhánh B) cùng cộng dồn, chảy ngược
+          lại đúng MỘT bảng E^(0) ở [2]. Đây mới là nơi 2 nhánh thực sự
+          "kết hợp": không trộn embedding (representation), mà trộn gradient
+          trên đúng một bộ tham số dùng chung. Xem giải thích đầy đủ ngay
+          bên dưới bản đồ này.
 ```
 
 **Vì sao chia thành 2 nhánh?** Nhánh chính (Phần III) lo việc dự đoán chính xác — gần như y hệt LightGCN gốc. Nhánh phụ (Phần IV) chỉ tồn tại để "huấn luyện thêm" cho embedding tốt hơn, không bao giờ được dùng để đưa ra gợi ý cuối cùng. Đọc hết Phần III trước sẽ dễ hiểu vì sao Phần IV lại được thiết kế như vậy.
